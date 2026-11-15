@@ -1,0 +1,21 @@
+# Build artifacts
+*.o
+*.mod
+*.smod
+/build/
+/qwen35-cpu
+/qwen-cuda
+src-cpu/utils/*.o
+src-cpu/build_tokenizer
+src-cpu/tests/test_*
+!src-cpu/tests/test_*.c
+
+# Tokenizer / reference dumps (regenerable)
+src-cpu/tokenizer.bin
+src-cpu/refs/*.bin
+artifacts/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
