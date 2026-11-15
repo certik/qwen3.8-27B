@@ -7,6 +7,7 @@ program qwen_raw
     use safetensors_io, only: tensor_archive
     use qwen_weights, only: dense_weight_layout
     use inference_dump, only: configure_dump
+    use qwen_tokenizer
     implicit none
     type(inference_model), target :: model
     type(dense_config) :: cfg
@@ -14,11 +15,17 @@ program qwen_raw
     type(dense_weight_layout) :: layout
     type(layer_state), allocatable :: prefill_state(:)
     type(io_error) :: error
+    type(bpe_tokenizer) :: tok
+    type(text_stream) :: stream
     integer(int32), allocatable :: input_ids(:), teacher(:), generated(:), consumed(:), reset_ids(:), reset_consumed(:)
     integer(int16), allocatable :: logits(:,:), saved_logits(:,:), logprobs(:), saved_logprobs(:)
     type(execution_counts) :: inference_counts, reset_counts
     character(:), allocatable :: directory, input_path, teacher_path, dump_path, result_path, lp_path, arg, value, call_path
     character(32) :: number
+    character(:), allocatable :: prompt_text, prompt_file, system_text, tokenize_text, tokenize_file
+    character(:), allocatable :: detok_path, tokenizer_dir, effort, rendered, generated_text, stream_buf, terr
+    character(:), allocatable :: system_file
+    logical :: raw, have_prompt, have_system, have_tokenize, chat, thinking, text_out, max_set, use_tok, streaming
     integer :: i, max_tokens, n_out, reset_n, capacity, processed, unit, ios, diagnostic_layer
     integer(int64) :: count64, clock_rate, t_start, t_loaded
     real(8) :: load_s, prefill_s, decode_s, first_step_s, step_max_s, median_s
@@ -42,6 +49,24 @@ program qwen_raw
     check_config=.false.
     inspect=.false.
     diagnostic_layer=-2
+    prompt_text=''
+    prompt_file=''
+    system_text=''
+    system_file=''
+    tokenize_text=''
+    tokenize_file=''
+    detok_path=''
+    tokenizer_dir=''
+    effort='xhigh'
+    have_prompt=.false.
+    have_system=.false.
+    have_tokenize=.false.
+    chat=.false.
+    thinking=.true.
+    text_out=.false.
+    max_set=.false.
+    streaming=.false.
+    raw=.false.
     i=1
     do while (i <= command_argument_count())
         arg=argument(i)
@@ -54,11 +79,24 @@ program qwen_raw
             check_config=.true.
         case('--inspect')
             inspect=.true.
-        case('--model','--input-ids','--teacher-ids','--dump','--result','--logprobs-out','--max-tokens','--dump-layer')
+        case('--chat')
+            chat=.true.
+        case('--raw')
+            raw=.true.
+        case('--think')
+            thinking=.true.
+        case('--no-think')
+            thinking=.false.
+        case('--text')
+            text_out=.true.
+        case('--model','--input-ids','--teacher-ids','--dump','--result','--logprobs-out','--max-tokens','--dump-layer', &
+                '--prompt','--prompt-file','--system','--system-file','--tokenize','--tokenize-file', &
+                '--detokenize','--tokenizer','--reasoning-effort')
             i=i+1
             if (i > command_argument_count()) error stop 'missing argument value'
             value=argument(i)
-            if (len(value) == 0) error stop 'empty argument value'
+            if (len(value) == 0 .and. arg /= '--prompt' .and. arg /= '--system' .and. arg /= '--tokenize') &
+                error stop 'empty argument value'
             select case(arg)
             case('--model')
                 directory=value
@@ -77,17 +115,83 @@ program qwen_raw
                 read(value,*,iostat=ios) max_tokens
                 if (ios /= 0) error stop '--max-tokens integer overflow'
                 if (max_tokens < 1) error stop '--max-tokens must be positive'
+                max_set=.true.
+            case('--prompt')
+                prompt_text=value
+                have_prompt=.true.
+            case('--prompt-file')
+                prompt_file=value
+                have_prompt=.true.
+            case('--system')
+                system_text=value
+                have_system=.true.
+            case('--system-file')
+                system_file=value
+                have_system=.true.
+            case('--tokenize')
+                tokenize_text=value
+                have_tokenize=.true.
+            case('--tokenize-file')
+                tokenize_file=value
+                have_tokenize=.true.
+            case('--detokenize')
+                detok_path=value
+            case('--tokenizer')
+                tokenizer_dir=value
+            case('--reasoning-effort')
+                effort=value
+                if (effort /= 'xhigh' .and. effort /= 'medium' .and. effort /= 'low') &
+                    error stop '--reasoning-effort must be xhigh, medium or low'
             case('--dump-layer')
                 if (verify(value,'0123456789') /= 0) error stop '--dump-layer must be a nonnegative layer'
                 read(value,*,iostat=ios) diagnostic_layer
                 if (ios /= 0) error stop '--dump-layer integer overflow'
             end select
         case default
-            error stop 'unknown argument; raw-ID input only (no tokenizer/chat/vision): '//arg
+            error stop 'unknown argument: '//arg
         end select
         i=i+1
     end do
+    ! A text prompt is answered like a chat turn and the answer is printed as text,
+    ! unless --raw asks for the prompt to be tokenized as is.
+    if (have_prompt .and. .not. raw) chat=.true.
+    if (have_prompt) text_out=.true.
+    if (len(tokenizer_dir) == 0) tokenizer_dir=directory
+    if (have_tokenize .or. len(detok_path) /= 0) then
+        ! Standalone tokenizer modes: no config, no weights.
+        if (len(tokenizer_dir) == 0) error stop '--model (or --tokenizer) is required'
+        if (have_tokenize .and. len(detok_path) /= 0) error stop '--tokenize and --detokenize are exclusive'
+        call load_tokenizer(tokenizer_dir,tok,terr)
+        if (allocated(terr)) error stop terr
+        if (have_tokenize) then
+            if (len(tokenize_file) /= 0) then
+                call read_file_bytes(tokenize_file,tokenize_text,terr)
+                if (allocated(terr)) error stop terr
+            end if
+            if (chat) then
+                call apply_system()
+                tokenize_text=chat_prompt(tokenize_text,system_text,thinking,effort)
+            end if
+            call encode_text(tok,tokenize_text,input_ids)
+            write(output_unit,'(a)',advance='no') '['
+            do i=1,size(input_ids)
+                write(number,'(i0)') input_ids(i)
+                if (i > 1) write(output_unit,'(a)',advance='no') ','
+                write(output_unit,'(a)',advance='no') trim(number)
+            end do
+            write(output_unit,'(a)') ']'
+        else
+            call read_input_ids(detok_path,input_ids,error,int(tok%n_tokens,int64))
+            call require_io(error)
+            generated_text=decode_ids(tok,input_ids)
+            write(output_unit,'(a)',advance='no',iostat=ios) generated_text
+            if (ios /= 0) error stop 'text write failed'
+        end if
+        exit application
+    end if
     if (len(directory) == 0) error stop '--model is required'
+    if (chat .and. .not. have_prompt) error stop '--chat requires --prompt or --prompt-file'
+    if (have_system .and. .not. chat) error stop '--system requires --chat'
     call configure_dump(diagnostic_layer)
     call read_config(directory//'/config.json',cfg,error)
     call require_io(error)
@@ -130,11 +234,35 @@ program qwen_raw
         if (ios /= 0) error stop 'metadata report write failed'
         exit application
     end if
-    if (len(input_path) == 0) error stop '--input-ids is required; tokenizer/chat/NFC are not implemented'
+    use_tok=have_prompt .or. text_out
+    if (have_prompt .and. len(input_path) /= 0) error stop '--prompt and --input-ids are exclusive'
+    if (len(input_path) == 0 .and. .not. have_prompt) error stop '--input-ids, --prompt or --prompt-file is required'
+    if (have_prompt .and. .not. max_set) max_tokens=256
+    if (use_tok) then
+        call load_tokenizer(tokenizer_dir,tok,terr)
+        if (allocated(terr)) error stop terr
+        allocate(character(3*(tok%max_len+4)) :: stream_buf)
+    end if
     if (len(lp_path) /= 0 .and. reset_check) error stop '--logprobs-out is incompatible with --reset-check'
     if (len(teacher_path) /= 0 .and. .not. fixed) error stop '--teacher-ids requires --fixed-steps'
-    call read_input_ids(input_path,input_ids,error,int(cfg%vocab,int64))
-    call require_io(error)
+    if (have_prompt) then
+        if (len(prompt_file) /= 0) then
+            call read_file_bytes(prompt_file,prompt_text,terr)
+            if (allocated(terr)) error stop terr
+        end if
+        rendered=prompt_text
+        if (chat) then
+            call apply_system()
+            rendered=chat_prompt(prompt_text,system_text,thinking,effort)
+        end if
+        call encode_text(tok,rendered,input_ids)
+        if (size(input_ids) < 1) error stop 'prompt tokenizes to zero tokens'
+        if (any(input_ids >= cfg%vocab)) error stop 'tokenizer produced an id outside the model vocabulary'
+    else
+        call read_input_ids(input_path,input_ids,error,int(cfg%vocab,int64))
+        call require_io(error)
+        if (use_tok) rendered=decode_ids(tok,input_ids,.false.)
+    end if
     if (len(teacher_path) /= 0) then
         call read_input_ids(teacher_path,teacher,error,int(cfg%vocab,int64))
         call require_io(error)
@@ -158,7 +286,14 @@ program qwen_raw
         if (ios /= 0) error stop 'cannot create new logprobs file'
         write(lp_unit,'(a)') '{"schema":1,"steps":['
     end if
+    streaming=text_out
     call generate_request(generated,consumed,n_out,lookahead,dump_path)
+    streaming=.false.
+    if (text_out) then
+        write(output_unit,'()')
+        flush(output_unit)
+    end if
+    if (use_tok) generated_text=decode_ids(tok,generated(:n_out))
     if (lp_on) then
         write(lp_unit,'(a)') ']}'
         close(lp_unit)
@@ -190,7 +325,8 @@ program qwen_raw
         open(newunit=unit,file=result_path,status='new',action='write',iostat=ios)
         if (ios /= 0) error stop 'cannot create new result file'
     end if
-    call report(unit)
+    ! A text prompt prints only the answer; the JSON report needs --result.
+    if (len(result_path) /= 0 .or. .not. have_prompt) call report(unit)
     if (len(result_path) /= 0) then
         close(unit,iostat=ios)
         if (ios /= 0) error stop 'result close failed'
@@ -294,6 +430,9 @@ contains
         end if
         emitted=0
         do step=1,max_tokens
+            if (streaming) then
+                if (fixed .or. .not. stop_id(current)) call emit_text(current)
+            end if
             token(1)=current
             if (allocated(teacher)) token(1)=teacher(step)
             inputs(step)=token(1)
@@ -320,9 +459,13 @@ contains
             end if
             emitted=emitted+1
             outputs(emitted)=current
-            if (any(cfg%eos_ids == current) .and. .not. fixed) exit
+            if (stop_id(current) .and. .not. fixed) exit
             current=final_id
         end do
+        if (streaming) then
+            call stream_flush(stream,stream_buf,step)
+            if (step > 0) write(output_unit,'(a)',advance='no') stream_buf(1:step)
+        end if
         if (.not. timing_done) then
             prefill_s=real(t_pre-t_begin,8)/real(clock_rate,8)
             timing_done=.true.
@@ -377,6 +520,30 @@ contains
             ',"steady_decode_tok_per_s":',rate,'}'
         t=trim(buf)
     end function
+
+    logical function stop_id(id)
+        integer(int32), intent(in) :: id
+        stop_id=any(cfg%eos_ids == id)
+        if (use_tok) stop_id=stop_id .or. is_stop_token(tok,int(id))
+    end function
+
+    subroutine emit_text(id)
+        integer(int32), intent(in) :: id
+        integer :: m, st
+        call stream_feed(tok,stream,int(id),stream_buf,m)
+        if (m > 0) then
+            write(output_unit,'(a)',advance='no',iostat=st) stream_buf(1:m)
+            if (st /= 0) error stop 'text write failed'
+            flush(output_unit)
+        end if
+    end subroutine
+
+    subroutine apply_system()
+        if (len(system_file) /= 0) then
+            call read_file_bytes(system_file,system_text,terr)
+            if (allocated(terr)) error stop terr
+        end if
+    end subroutine
 
     function argument(index) result(text)
         integer, intent(in) :: index
@@ -437,7 +604,12 @@ contains
         call text(',"extra_unemitted_decode_forwards":1,"reset_checked":'//boolean(reset_check))
         call text(',"reset_cache_and_logits_exact":'//boolean(reset_check))
         call text(timing_json())
-        call text(',"dump_io_included":'//boolean(len(dump_path) /= 0)//',"throughput_valid":false}')
+        call text(',"dump_io_included":'//boolean(len(dump_path) /= 0)//',"throughput_valid":false')
+        if (use_tok) then
+            call text(',"prompt_text":"'//json_escape(rendered)//'"')
+            call text(',"generated_text":"'//json_escape(generated_text)//'"')
+        end if
+        call text('}')
         write(u,'()',iostat=ios)
         if (ios /= 0) error stop 'result write failed'
     end subroutine

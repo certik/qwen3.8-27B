@@ -1,5 +1,8 @@
 # Pure-Fortran raw-ID dense-hybrid reference
 
+Text prompts, the chat template and text output are handled by `qwen_tokenizer.f90` and `main.f90`
+(see the top-level README); the id-only interface below is unchanged.
+
 ## Current FN native-semantic CPU profile
 
 This branch replaces the obsolete scalar-C numerical graph with standard

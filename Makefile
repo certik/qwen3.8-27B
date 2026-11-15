@@ -7,6 +7,7 @@
 #
 # Fortran implementation (src-fortran):
 #   make fortran-gpu           # builds ./qwen-fortran-cuda with LFortran (--gpu=cuda)
+#   make fortran-tokenizer-test MODEL_DIR=...   # tokenizer vs HuggingFace tokenizers
 #
 # CUDA implementation (src-cuda):
 #   make cuda                  # builds src-cuda/qwen with nvcc
@@ -47,7 +48,7 @@ TEST_BINS := src-cpu/tests/test_validation
 
 BUILD_TOK := src-cpu/build_tokenizer
 
-.PHONY: all clean tests run tokenizer qwen35-cpu-check fortran-gpu cuda
+.PHONY: all clean tests run tokenizer qwen35-cpu-check fortran-gpu fortran-tokenizer-test cuda
 
 all: $(BIN)
 
@@ -89,7 +90,7 @@ FSRCS := src-fortran/precision_formats.f90 src-fortran/dense_kernels.f90 \
          src-fortran/model_io_support.f90 src-fortran/json_tokens.f90 \
          src-fortran/safetensors_io.f90 src-fortran/qwen_config.f90 \
          src-fortran/qwen_weights.f90 src-fortran/inference_dump.f90 \
-         src-fortran/dense_model.f90 src-fortran/main.f90
+         src-fortran/dense_model.f90 src-fortran/qwen_tokenizer.f90 src-fortran/main.f90
 
 # LFortran (recent main) offloads the do concurrent loops to the GPU.
 # The linker defaults to clang; use LFORTRAN_LINKER=gcc where there is none.
@@ -98,6 +99,14 @@ qwen-fortran-cuda: $(FSRCS)
 	rm -f src-fortran/*.mod
 	lfortran --fast --gpu=cuda --gpu-overlap $(FSRCS) -o $@
 	rm -f src-fortran/*.mod
+
+# The tokenizer test needs only the model's tokenizer files and `pip install tokenizers`.
+fortran-tokenizer-test:
+	mkdir -p build
+	rm -f src-fortran/*.mod
+	lfortran src-fortran/qwen_tokenizer.f90 src-fortran/tests/test_tokenizer.f90 -o build/test_tokenizer
+	rm -f src-fortran/*.mod *.mod
+	python3 src-fortran/tests/test_tokenizer.py --model $(MODEL_DIR) --binary build/test_tokenizer
 
 cuda:
 	$(MAKE) -C src-cuda

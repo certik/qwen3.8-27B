@@ -49,6 +49,9 @@ native-cpu-replay = "python src-fortran/tests/test_native_cpu.py --native-eviden
 native-model-check = "python src-fortran/tests/run_native_model.py"
 native-cpu-admission-tests = "python -m unittest discover -s src-fortran/tests -p test_native_admission.py -v"
 native-cpu-terminal-prefix-test = { cmd = "python src-fortran/tests/test_native_cpu.py --terminal-prefix-only", depends-on = ["driver-build"] }
+tokenizer-build-gfortran = "sh src-fortran/tests/build_tokenizer.sh gfortran"
+tokenizer-build-flang = "sh src-fortran/tests/build_tokenizer.sh flang"
+tokenizer-test = { cmd = "python src-fortran/tests/test_tokenizer.py --binary build/fortran-tokenizer/gfortran/test_tokenizer --model", depends-on = ["tokenizer-build-gfortran", "tokenizer-build-flang"] }
 driver-gfortran = "build/fortran-driver/gfortran/qwen-raw"
 driver-flang = "build/fortran-driver/flang/qwen-raw"
 
