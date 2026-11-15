@@ -4,7 +4,8 @@
 *.smod
 /build/
 /qwen35-cpu
-/qwen-cuda
+/qwen-fortran-cuda
+/src-cuda/qwen
 src-cpu/utils/*.o
 src-cpu/build_tokenizer
 src-cpu/tests/test_*

@@ -5,6 +5,9 @@
 #   make run                   # runs the MoE CPU reference
 #   make tests                 # model-free CPU precision checks
 #
+# Fortran implementation (src-fortran):
+#   make fortran-gpu           # builds ./qwen-fortran-cuda with LFortran (--gpu=cuda)
+#
 # Common:
 #   make clean
 
@@ -41,7 +44,7 @@ TEST_BINS := src-cpu/tests/test_validation
 
 BUILD_TOK := src-cpu/build_tokenizer
 
-.PHONY: all clean tests run tokenizer qwen35-cpu-check
+.PHONY: all clean tests run tokenizer qwen35-cpu-check fortran-gpu
 
 all: $(BIN)
 
@@ -77,7 +80,24 @@ MODEL_DIR ?= /path/to/model
 run: $(BIN) src-cpu/tokenizer.bin
 	./$(BIN) --prompt "Hello, who are you?" --max-tokens 8 --model $(MODEL_DIR)
 
+# ---------- Fortran implementation ------------------------------------------
+
+FSRCS := src-fortran/precision_formats.f90 src-fortran/dense_kernels.f90 \
+         src-fortran/model_io_support.f90 src-fortran/json_tokens.f90 \
+         src-fortran/safetensors_io.f90 src-fortran/qwen_config.f90 \
+         src-fortran/qwen_weights.f90 src-fortran/inference_dump.f90 \
+         src-fortran/dense_model.f90 src-fortran/main.f90
+
+# LFortran (recent main) offloads the do concurrent loops to the GPU.
+# The linker defaults to clang; use LFORTRAN_LINKER=gcc where there is none.
+fortran-gpu: qwen-fortran-cuda
+qwen-fortran-cuda: $(FSRCS)
+	rm -f src-fortran/*.mod
+	lfortran --fast --gpu=cuda --gpu-overlap $(FSRCS) -o $@
+	rm -f src-fortran/*.mod
+
 clean:
 	rm -f src-cpu/*.o src-cpu/utils/*.o src-cpu/tests/*.o $(TEST_BINS) \
 	      src-cpu/tests/test_kernels src-cpu/tests/test_precision_replay \
-	      $(BIN) qwen35-cpu-check $(BUILD_TOK)
+	      $(BIN) qwen35-cpu-check $(BUILD_TOK) \
+	      qwen-fortran-cuda

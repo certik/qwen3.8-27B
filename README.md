@@ -17,3 +17,16 @@ $ ./qwen35-cpu --model "$MODEL_DIR" --input-ids ids.json --max-tokens 17 --fixed
 ```
 
 See [`src-cpu/README.md`](src-cpu/README.md).
+
+## Fortran implementation
+
+Plain Fortran (`do concurrent`, no C, no vendor libraries) that LFortran compiles
+for the GPU with `--gpu=cuda`:
+
+```console
+$ LFORTRAN_LINKER=gcc make fortran-gpu      # needs a recent LFortran main
+$ ./qwen-fortran-cuda --model "$MODEL_DIR" --input-ids ids.json --max-tokens 33 --fixed-steps --result out.json
+```
+
+On one H200 NVL: 102 tok/s decode (9.8 ms per token), prefill of 5 tokens in 0.7 s.
+See [`src-fortran/README.md`](src-fortran/README.md).

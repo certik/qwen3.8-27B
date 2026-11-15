@@ -1,0 +1,56 @@
+[workspace]
+name = "qwen-fortran"
+version = "0.1.0"
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "linux-64"]
+
+[dependencies]
+python = "3.12.*"
+
+# CPU-only Fortran checks. Compilers come from PATH (GFortran and, where a
+# task lists it, Flang). This environment does not install MLX.
+[feature.fortran-precision.dependencies]
+python = "3.12.*"
+
+[feature.fortran-precision.tasks]
+precision-versions = "printf 'Pixi: ' && pixi --version && printf 'Inherited PATH: %s\\n' \"$PATH\" && printf 'GFortran PATH: ' && command -v gfortran && ls -l \"$(command -v gfortran)\" && gfortran --version && printf 'Flang PATH: ' && command -v flang && ls -l \"$(command -v flang)\" && flang --version && printf 'C oracle compiler: ' && xcrun --find clang && xcrun clang --version"
+precision-build-oracle = "mkdir -p build/fortran-precision && xcrun clang -std=c11 -O2 -Wall -Wextra -Werror -pedantic -fno-fast-math -Isrc-cpu/utils src-fortran/tests/bf16_oracle.c -lm -o build/fortran-precision/bf16_oracle"
+precision-build-gfortran = { cmd = "mkdir -p build/fortran-precision/gfortran/core && gfortran -std=f2018 -pedantic -Wall -Wextra -Werror -O2 -fno-fast-math -fcheck=all -Jbuild/fortran-precision/gfortran/core -Ibuild/fortran-precision/gfortran/core src-fortran/precision_formats.f90 src-fortran/tests/precision_test_cases.f90 src-fortran/tests/test_precision.f90 -o build/fortran-precision/gfortran/core/test_precision", depends-on = ["precision-oracle"] }
+precision-build-flang = { cmd = "mkdir -p build/fortran-precision/flang/core && flang -std=f2018 -pedantic -Werror -O2 -fno-fast-math -Jbuild/fortran-precision/flang/core -Ibuild/fortran-precision/flang/core src-fortran/precision_formats.f90 src-fortran/tests/precision_test_cases.f90 src-fortran/tests/test_precision.f90 -o build/fortran-precision/flang/core/test_precision", depends-on = ["precision-oracle"] }
+precision-oracle = { cmd = "build/fortran-precision/bf16_oracle > build/fortran-precision/oracle.txt", depends-on = ["precision-build-oracle"] }
+precision-test-gfortran = { cmd = "sh src-fortran/tests/run_checks.sh build/fortran-precision/gfortran/core/test_precision build/fortran-precision/oracle.txt build/fortran-precision/gfortran/core/checks", depends-on = ["precision-build-gfortran"] }
+precision-test-flang = { cmd = "sh src-fortran/tests/run_checks.sh build/fortran-precision/flang/core/test_precision build/fortran-precision/oracle.txt build/fortran-precision/flang/core/checks", depends-on = ["precision-build-flang"] }
+precision-test = { depends-on = ["precision-test-gfortran", "precision-test-flang"] }
+precision-ieee-build-gfortran = { cmd = "mkdir -p build/fortran-precision/gfortran/ieee && gfortran -std=f2018 -pedantic -Wall -Wextra -Werror -O2 -fno-fast-math -fcheck=all -Jbuild/fortran-precision/gfortran/ieee -Ibuild/fortran-precision/gfortran/ieee src-fortran/precision_formats.f90 src-fortran/tests/precision_test_cases.f90 src-fortran/tests/test_precision_ieee.f90 -o build/fortran-precision/gfortran/ieee/test_precision_ieee", depends-on = ["precision-oracle"] }
+precision-ieee-build-flang = { cmd = "mkdir -p build/fortran-precision/flang/ieee && flang -std=f2018 -pedantic -Werror -O2 -fno-fast-math -Jbuild/fortran-precision/flang/ieee -Ibuild/fortran-precision/flang/ieee src-fortran/precision_formats.f90 src-fortran/tests/precision_test_cases.f90 src-fortran/tests/test_precision_ieee.f90 -o build/fortran-precision/flang/ieee/test_precision_ieee", depends-on = ["precision-oracle"] }
+precision-ieee-test-gfortran = { cmd = "sh src-fortran/tests/run_checks.sh build/fortran-precision/gfortran/ieee/test_precision_ieee build/fortran-precision/oracle.txt build/fortran-precision/gfortran/ieee/checks", depends-on = ["precision-ieee-build-gfortran"] }
+precision-ieee-test-flang = { cmd = "sh src-fortran/tests/run_checks.sh build/fortran-precision/flang/ieee/test_precision_ieee build/fortran-precision/oracle.txt build/fortran-precision/flang/ieee/checks", depends-on = ["precision-ieee-build-flang"] }
+precision-ieee-test = { depends-on = ["precision-ieee-test-gfortran", "precision-ieee-test-flang"] }
+dense-build-oracle = "sh src-fortran/tests/build_dense_oracle.sh"
+dense-oracle = { cmd = "build/fortran-dense/dense_oracle build/fortran-dense/oracle.bin", depends-on = ["dense-build-oracle"] }
+dense-build-gfortran = { cmd = "mkdir -p build/fortran-dense/gfortran && gfortran -std=f2018 -pedantic -Wall -Wextra -Werror -Waliasing -Wimplicit-interface -O2 -fno-fast-math -ffp-contract=off -fcheck=all -Jbuild/fortran-dense/gfortran -Ibuild/fortran-dense/gfortran src-fortran/precision_formats.f90 src-fortran/dense_kernels.f90 src-fortran/tests/test_dense_kernels.f90 -o build/fortran-dense/gfortran/test_dense_kernels", depends-on = ["dense-oracle"] }
+dense-build-flang = { cmd = "mkdir -p build/fortran-dense/flang && flang -std=f2018 -pedantic -Werror -O2 -fno-fast-math -ffp-contract=off -Jbuild/fortran-dense/flang -Ibuild/fortran-dense/flang src-fortran/precision_formats.f90 src-fortran/dense_kernels.f90 src-fortran/tests/test_dense_kernels.f90 -o build/fortran-dense/flang/test_dense_kernels", depends-on = ["dense-oracle"] }
+dense-test-gfortran = { cmd = "sh src-fortran/tests/run_dense_checks.sh build/fortran-dense/gfortran/test_dense_kernels build/fortran-dense/oracle.bin build/fortran-dense/gfortran/checks", depends-on = ["dense-build-gfortran"] }
+dense-test-flang = { cmd = "sh src-fortran/tests/run_dense_checks.sh build/fortran-dense/flang/test_dense_kernels build/fortran-dense/oracle.bin build/fortran-dense/flang/checks", depends-on = ["dense-build-flang"] }
+dense-test = { cmd = "python src-fortran/tests/test_native_cpu.py --math-only", depends-on = ["driver-build"] }
+attention-state-test = { depends-on = ["dense-test"] }
+io-build-gfortran = "sh src-fortran/tests/build_io.sh gfortran"
+io-build-flang = "sh src-fortran/tests/build_io.sh flang"
+io-test = { cmd = "python src-fortran/tests/test_model_io.py", depends-on = ["io-build-gfortran", "io-build-flang"] }
+io-test-model = { cmd = "python src-fortran/tests/test_model_io.py --model", depends-on = ["io-build-gfortran", "io-build-flang"] }
+io-python = "python"
+driver-build-gfortran = { cmd = "sh src-fortran/tests/build_driver.sh gfortran", depends-on = ["driver-build-oracle"] }
+driver-build-flang = { cmd = "sh src-fortran/tests/build_driver.sh flang", depends-on = ["driver-build-oracle"] }
+driver-build-oracle = "sh src-fortran/tests/build_driver_oracle.sh"
+driver-build = { depends-on = ["driver-build-gfortran", "driver-build-flang"] }
+driver-test = { depends-on = ["native-cpu-test"] }
+native-cpu-test = { cmd = "python src-fortran/tests/test_native_cpu.py", depends-on = ["driver-build", "native-cpu-admission-tests"] }
+native-cpu-replay = "python src-fortran/tests/test_native_cpu.py --native-evidence ../mlx-native"
+native-model-check = "python src-fortran/tests/run_native_model.py"
+native-cpu-admission-tests = "python -m unittest discover -s src-fortran/tests -p test_native_admission.py -v"
+native-cpu-terminal-prefix-test = { cmd = "python src-fortran/tests/test_native_cpu.py --terminal-prefix-only", depends-on = ["driver-build"] }
+driver-gfortran = "build/fortran-driver/gfortran/qwen-raw"
+driver-flang = "build/fortran-driver/flang/qwen-raw"
+
+[environments]
+fortran-precision = { features = ["fortran-precision"], no-default-feature = true }
