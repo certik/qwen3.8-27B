@@ -8,6 +8,9 @@
 # Fortran implementation (src-fortran):
 #   make fortran-gpu           # builds ./qwen-fortran-cuda with LFortran (--gpu=cuda)
 #
+# CUDA implementation (src-cuda):
+#   make cuda                  # builds src-cuda/qwen with nvcc
+#
 # Common:
 #   make clean
 
@@ -44,7 +47,7 @@ TEST_BINS := src-cpu/tests/test_validation
 
 BUILD_TOK := src-cpu/build_tokenizer
 
-.PHONY: all clean tests run tokenizer qwen35-cpu-check fortran-gpu
+.PHONY: all clean tests run tokenizer qwen35-cpu-check fortran-gpu cuda
 
 all: $(BIN)
 
@@ -96,7 +99,11 @@ qwen-fortran-cuda: $(FSRCS)
 	lfortran --fast --gpu=cuda --gpu-overlap $(FSRCS) -o $@
 	rm -f src-fortran/*.mod
 
+cuda:
+	$(MAKE) -C src-cuda
+
 clean:
+	$(MAKE) -C src-cuda clean
 	rm -f src-cpu/*.o src-cpu/utils/*.o src-cpu/tests/*.o $(TEST_BINS) \
 	      src-cpu/tests/test_kernels src-cpu/tests/test_precision_replay \
 	      $(BIN) qwen35-cpu-check $(BUILD_TOK) \

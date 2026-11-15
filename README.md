@@ -30,3 +30,13 @@ $ ./qwen-fortran-cuda --model "$MODEL_DIR" --input-ids ids.json --max-tokens 33 
 
 On one H200 NVL: 102 tok/s decode (9.8 ms per token), prefill of 5 tokens in 0.7 s.
 See [`src-fortran/README.md`](src-fortran/README.md).
+
+## CUDA implementation
+
+A self-contained C + CUDA program (no cuBLAS, no Python): about 120 tok/s decode on one H200 NVL,
+with its own tokenizer, safetensors reader and sampling. See [`src-cuda/README.md`](src-cuda/README.md).
+
+```console
+$ make cuda
+$ src-cuda/qwen -p "What is the capital of France? Answer in one sentence." --no-think
+```
