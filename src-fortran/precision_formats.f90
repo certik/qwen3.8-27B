@@ -7,7 +7,7 @@ module precision_formats
     public :: require_precision_environment
     public :: bf16_bits_to_fp32_bits, fp32_bits_to_bf16_bits
     public :: bf16_bits_to_real32, real32_to_bf16_bits
-    public :: packed_q8_byte
+    public :: packed_q8_byte, dp4a
 
 contains
 
@@ -82,23 +82,23 @@ contains
         value = ibits(word, 8 * byte_index, 8)
     end function packed_q8_byte
 
+    ! Integer dot product of four signed bytes with four signed bytes, plus c: the
+    ! bytes of a and of b are read as int8 (sign-extended by an arithmetic shift),
+    ! multiplied pairwise and summed into c. The four products add up to at most
+    ! 2**16 in magnitude, so the result does not overflow as long as |c| < 2**30
+    ! (callers pass 0 or a partial sum of the same kind). Written out as plain
+    ! integer arithmetic so that any compiler can run it; a compiler may recognize
+    ! this form and use a hardware dot-product instruction (such as dp4a on NVIDIA
+    ! GPUs) for it. The byte order does not matter as long as a and b use the same.
+    pure elemental function dp4a(a, b, c) result(r)
+        !$acc routine seq
+        integer(int32), intent(in) :: a, b, c
+        integer(int32) :: r
+
+        r = c + shifta(shiftl(a, 24), 24) * shifta(shiftl(b, 24), 24) &
+              + shifta(shiftl(a, 16), 24) * shifta(shiftl(b, 16), 24) &
+              + shifta(shiftl(a,  8), 24) * shifta(shiftl(b,  8), 24) &
+              + shifta(a, 24) * shifta(b, 24)
+    end function dp4a
+
 end module precision_formats
-
-! Host definition of the symbol the integer dot product of the GPU is called
-! through (dense_kernels declares it as an interface); the kernels use the
-! device instruction. The four signed bytes of a and of b, multiplied and summed.
-function dp4a_definition(a, b, c) bind(c, name="__dp4a") result(r)
-    use, intrinsic :: iso_c_binding, only: c_int
-    integer(c_int), value, intent(in) :: a, b, c
-    integer(c_int) :: r
-    integer :: i, x, y
-
-    r = c
-    do i = 0, 3
-        x = iand(ishft(a, -8*i), 255)
-        y = iand(ishft(b, -8*i), 255)
-        if (x > 127) x = x - 256
-        if (y > 127) y = y - 256
-        r = r + x*y
-    end do
-end function dp4a_definition

@@ -1,20 +1,10 @@
 module dense_kernels
     use, intrinsic :: iso_fortran_env, only: int16, int32, int64, real32
-    use, intrinsic :: iso_c_binding, only: c_int
     use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_negative_inf, ieee_is_finite
-    use precision_formats, only: bf16_bits_to_real32, real32_to_bf16_bits, packed_q8_byte
+    use precision_formats, only: bf16_bits_to_real32, real32_to_bf16_bits, packed_q8_byte, dp4a
     implicit none
     private
 
-    interface
-        ! The CUDA integer dot product of four signed bytes with four signed bytes,
-        ! plus an integer.
-        pure function dp4a(a, b, c) bind(c, name="__dp4a") result(r)
-            import :: c_int
-            integer(c_int), value, intent(in) :: a, b, c
-            integer(c_int) :: r
-        end function dp4a
-    end interface
     public :: embed_dequant_gather_q8, linear_q8_bf16
     public :: rmsnorm_bf16, rmsnorm_scale_bf16, argmax_bf16
     public :: silu_mul_bf16, silu_mul_f32_gate_bf16, elemwise_sigmoid_mul_bf16
