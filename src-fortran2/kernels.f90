@@ -17,7 +17,7 @@ module kernels
     use, intrinsic :: iso_fortran_env, only: int16, int32
     implicit none
     private
-    public :: qmat, bf, embed, gemv_norm, gemv_resid, gdn_conv, gdn_step, gdn_update, gdn_norm
+    public :: qmat, bf, embed, gemv_norm, gemv_resid, gdn_conv, gdn_step, gdn_norm
     public :: attn_qkv, attn_scores, attn_out, argmax_part
 
     ! One MLX affine 8-bit matrix (group size 64) in the checkpoint's own layout: w(:, n) holds the K
@@ -82,8 +82,8 @@ contains
     end subroutine
 
     ! ------------------------------------------------------------ q8 GEMV
-    ! An iteration computes 4 consecutive rows (2 in gemv_resid); the lanes of a warp take its chunks of
-    ! 16 bytes, c = lane, lane + 32, ..., and combine their sums at the end.
+    ! An iteration computes 4 consecutive rows; its lanes (a warp, or two for a matrix with few rows)
+    ! take its chunks of 16 bytes, c = lane, lane + 32, ..., and combine their sums at the end.
 
     ! Chunk c (16 bytes) of row n dotted with x: scale * sum(byte * x) + bias * sum(x), with one scale
     ! and bias per 4 chunks.
@@ -136,28 +136,34 @@ contains
         end do
     end subroutine
 
-    ! x += W v; then xw = x * wnext and ssp, for the next RMSNorm (weight wnext). 2 rows per iteration:
-    ! these matrices have few rows (N = H), and 4 would leave the GPU with too few warps.
+    ! x += W v; then xw = x * wnext and ssp, for the next RMSNorm (weight wnext)
     subroutine gemv_resid(w, s, b, v, wnext, x, xw, ssp)
         integer(int32), intent(in) :: w(:,:)
         integer(int16), intent(in) :: s(:,:), b(:,:)
         real, intent(in) :: v(:), wnext(:)
         real, intent(inout) :: x(:), xw(:), ssp(:)
-        do concurrent (integer :: i = 1:size(w, 2)/2)
+        do concurrent (integer :: i = 1:size(w, 2)/4)
             block
-                real :: a1, a2
+                real :: a1, a2, a3, a4
                 integer :: c, n
-                n = 2*i - 1
-                a1 = 0; a2 = 0
+                n = 4*i - 3
+                a1 = 0; a2 = 0; a3 = 0; a4 = 0
                 do c = 1, size(w, 1)/4
                     a1 = a1 + qdot(w, s, b, v, n, c)
                     a2 = a2 + qdot(w, s, b, v, n+1, c)
+                    a3 = a3 + qdot(w, s, b, v, n+2, c)
+                    a4 = a4 + qdot(w, s, b, v, n+3, c)
                 end do
                 x(n) = x(n) + a1
                 x(n+1) = x(n+1) + a2
+                x(n+2) = x(n+2) + a3
+                x(n+3) = x(n+3) + a4
                 xw(n) = x(n) * wnext(n)
                 xw(n+1) = x(n+1) * wnext(n+1)
-                ssp(i) = x(n)*x(n) + x(n+1)*x(n+1)
+                xw(n+2) = x(n+2) * wnext(n+2)
+                xw(n+3) = x(n+3) * wnext(n+3)
+                ssp(2*i-1) = x(n)*x(n) + x(n+1)*x(n+1)
+                ssp(2*i) = x(n+2)*x(n+2) + x(n+3)*x(n+3)
             end block
         end do
     end subroutine
@@ -183,17 +189,18 @@ contains
         end do
     end subroutine
 
-    ! Column (v, h): the sums over the old state, the gates, delta and the output.
-    subroutine gdn_step(qkv, y, a_log, dt_bias, nk, st, o, dk, gh)
-        real, intent(in) :: qkv(:), y(:), a_log(:), dt_bias(:), st(:,:,:)
+    ! Column (v, h): the sums over the old state, the gates, delta and the output; then the column
+    ! of the new state, S = g*S + khat * delta^T.
+    subroutine gdn_step(qkv, y, a_log, dt_bias, nk, st, o)
+        real, intent(in) :: qkv(:), y(:), a_log(:), dt_bias(:)
         integer, intent(in) :: nk
-        real, intent(inout) :: o(:,:), dk(:,:), gh(:)
+        real, intent(inout) :: st(:,:,:), o(:,:)
         integer :: nv, c
         nv = size(st, 3)
         c = size(qkv)
         do concurrent (integer :: h = 1:nv, v = 1:GD)
             block
-                real :: sk, sq, kk, qq, kq, kn, qn, g, beta, delta, sp
+                real :: sk, sq, kk, qq, kq, kn, qn, g, beta, delta, sp, dk
                 integer :: j, kq0, kk0
                 kq0 = ((h-1) / (nv/nk)) * GD
                 kk0 = nk*GD + kq0
@@ -213,21 +220,11 @@ contains
                 beta = sigmoid(y(c + nv*GD + h))
                 delta = (qkv(2*nk*GD + (h-1)*GD + v) - g * sk * kn) * beta
                 o(v,h) = (g * sq + delta * kn * kq) * qn
-                dk(v,h) = delta * kn
-                if (v == 1) gh(h) = g
+                dk = delta * kn
+                do j = 1, GD
+                    st(j,v,h) = g * st(j,v,h) + qkv(kk0+j) * dk
+                end do
             end block
-        end do
-    end subroutine
-
-    ! S = g*S + khat * delta^T
-    subroutine gdn_update(qkv, nk, dk, gh, st)
-        real, intent(in) :: qkv(:), dk(:,:), gh(:)
-        integer, intent(in) :: nk
-        real, intent(inout) :: st(:,:,:)
-        integer :: nv
-        nv = size(st, 3)
-        do concurrent (integer :: h = 1:nv, v = 1:GD, j = 1:GD)
-            st(j,v,h) = gh(h) * st(j,v,h) + qkv(nk*GD + ((h-1) / (nv/nk))*GD + j) * dk(v,h)
         end do
     end subroutine
 

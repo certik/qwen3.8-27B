@@ -51,7 +51,7 @@ module model
     type :: state
         real, allocatable :: x(:), xw(:), ssp(:)     ! residual stream, x * next norm weight, sum x**2 parts
         real, allocatable :: y(:), o(:), mid(:), logits(:)
-        real, allocatable :: qkv(:), go(:,:), dk(:,:), gh(:)   ! Gated DeltaNet
+        real, allocatable :: qkv(:), go(:,:)         ! Gated DeltaNet
         real, allocatable :: qr(:,:), sc(:,:), rc(:), rs(:)   ! attention: q heads, scores, RoPE cos/sin
         real, allocatable :: pv(:)                   ! argmax parts (see np)
         integer, allocatable :: pi(:)
@@ -209,7 +209,6 @@ contains
                         2*c%query_dim + 2*c%kv_dim)), &
                 s%o(max(c%linear_value_dim, c%query_dim)), s%qkv(c%conv_dim), &
                 s%go(c%linear_value_head_dim, c%linear_value_heads), &
-                s%dk(c%linear_value_head_dim, c%linear_value_heads), s%gh(pad(c%linear_value_heads)), &
                 s%qr(c%head_dim, c%query_heads), s%sc(max_ctx, c%query_heads), s%rc(pad(c%rotary_dim/2)), s%rs(pad(c%rotary_dim/2)), &
                 s%pv(np), s%pi(np))
             do l = 1, c%layers
@@ -247,8 +246,7 @@ contains
                     call k_gemv_norm(y%in_proj, s%xw, s%ssp, c%rms_eps, .false., s%y)   ! y = W_in rmsnorm(x)
                     if (y%linear) then   ! Gated DeltaNet
                         call gdn_conv(s%y, y%conv_w, t%conv, s%qkv)
-                        call gdn_step(s%qkv, s%y, y%a_log, y%dt_bias, c%linear_key_heads, t%ssm, s%go, s%dk, s%gh)
-                        call gdn_update(s%qkv, c%linear_key_heads, s%dk, s%gh, t%ssm)
+                        call gdn_step(s%qkv, s%y, y%a_log, y%dt_bias, c%linear_key_heads, t%ssm, s%go)
                         call gdn_norm(s%go, s%y, c%conv_dim, y%norm_w, c%rms_eps, s%o)
                     else                 ! full attention
                         call attn_qkv(s%y, y%q_norm, y%k_norm, s%rc, s%rs, c%rms_eps, pos, s%qr, t%kc, t%vc)
