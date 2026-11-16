@@ -233,16 +233,19 @@ contains
         real, intent(in) :: o(:,:), y(:), nw(:), eps
         integer, intent(in) :: z0
         real, intent(inout) :: out(:)
-        do concurrent (integer :: h = 1:size(o, 2), v = 1:GD)
+        do concurrent (integer :: h = 1:size(o, 2))
             block
-                real :: ss, z
-                integer :: j
+                real :: ss, r, z
+                integer :: j, v
                 ss = 0
                 do j = 1, GD
                     ss = ss + o(j,h) * o(j,h)
                 end do
-                z = y(z0 + (h-1)*GD + v)
-                out((h-1)*GD + v) = o(v,h) / sqrt(ss / GD + eps) * nw(v) * z * sigmoid(z)
+                r = 1 / sqrt(ss / GD + eps)
+                do v = 1, GD
+                    z = y(z0 + (h-1)*GD + v)
+                    out((h-1)*GD + v) = o(v,h) * r * nw(v) * z * sigmoid(z)
+                end do
             end block
         end do
     end subroutine
