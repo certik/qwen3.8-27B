@@ -20,3 +20,4 @@ artifacts/
 __pycache__/
 *.pyc
 .venv/
+/qwen-fortran2-cuda

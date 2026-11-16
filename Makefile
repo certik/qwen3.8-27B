@@ -9,6 +9,9 @@
 #   make fortran-gpu           # builds ./qwen-fortran-cuda with LFortran (--gpu=cuda)
 #   make fortran-tokenizer-test MODEL_DIR=...   # tokenizer vs HuggingFace tokenizers
 #
+# Simplified Fortran implementation (src-fortran2, mirrors src-cuda):
+#   make fortran2-gpu          # builds ./qwen-fortran2-cuda with LFortran (--gpu=cuda)
+#
 # CUDA implementation (src-cuda):
 #   make cuda                  # builds src-cuda/qwen with nvcc
 #
@@ -48,7 +51,7 @@ TEST_BINS := src-cpu/tests/test_validation
 
 BUILD_TOK := src-cpu/build_tokenizer
 
-.PHONY: all clean tests run tokenizer qwen35-cpu-check fortran-gpu fortran-tokenizer-test cuda
+.PHONY: all clean tests run tokenizer qwen35-cpu-check fortran-gpu fortran2-gpu fortran-tokenizer-test cuda
 
 all: $(BIN)
 
@@ -100,6 +103,18 @@ qwen-fortran-cuda: $(FSRCS)
 	lfortran --fast --gpu=cuda --gpu-overlap $(FSRCS) -o $@
 	rm -f src-fortran/*.mod
 
+# src-fortran2 reuses the I/O, config and tokenizer modules of src-fortran.
+F2SRCS := src-fortran/model_io_support.f90 src-fortran/json_tokens.f90 \
+          src-fortran/safetensors_io.f90 src-fortran/qwen_config.f90 \
+          src-fortran/qwen_tokenizer.f90 src-fortran2/kernels.f90 src-fortran2/qwen.f90
+
+fortran2-gpu: qwen-fortran2-cuda
+qwen-fortran2-cuda: $(F2SRCS)
+	mkdir -p build/fortran2
+	cd build/fortran2 && lfortran --fast --realloc-lhs-arrays --gpu=cuda --gpu-overlap \
+	    $(addprefix $(CURDIR)/,$(F2SRCS)) -o $(CURDIR)/$@
+	rm -rf build/fortran2
+
 # The tokenizer test needs only the model's tokenizer files and `pip install tokenizers`.
 fortran-tokenizer-test:
 	mkdir -p build
@@ -116,4 +131,4 @@ clean:
 	rm -f src-cpu/*.o src-cpu/utils/*.o src-cpu/tests/*.o $(TEST_BINS) \
 	      src-cpu/tests/test_kernels src-cpu/tests/test_precision_replay \
 	      $(BIN) qwen35-cpu-check $(BUILD_TOK) \
-	      qwen-fortran-cuda
+	      qwen-fortran-cuda qwen-fortran2-cuda
