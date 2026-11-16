@@ -38,7 +38,7 @@ See [`src-cpu/README.md`](src-cpu/README.md).
 ## Fortran implementation
 
 Plain Fortran (`do concurrent`, no C, no vendor libraries) that LFortran compiles
-for the GPU with `--gpu=cuda`:
+for NVIDIA GPUs with `--gpu=cuda` or Apple GPUs with `--gpu=metal`:
 
 ```console
 $ LFORTRAN_LINKER=gcc make fortran-gpu      # needs a recent LFortran main
@@ -56,7 +56,7 @@ streams the answer as text; `--raw` tokenizes the prompt as is, `--system TEXT` 
 `--max-tokens N` (default 256) bounds the answer. For benchmarking, `--input-ids ids.json --fixed-steps
 --result out.json` runs on token ids and writes a JSON report.
 
-### Demo
+### NVIDIA GPU demo
 
 Built with LFortran `main` at `6855c1f679`, run on one H200 NVL (answers are generated on the GPU;
 `timing:` lines go to stderr):
@@ -94,6 +94,35 @@ Decode speed on one H200 NVL: **about 102 tok/s** (9.8 ms per token; 5 runs: 101
 For comparison the CUDA implementation reaches about 120 tok/s. Prefill is not optimized yet
 (about 2.3 s for a 24-token prompt).
 See [`src-fortran/README.md`](src-fortran/README.md).
+
+### Apple GPU (Metal)
+
+On Apple silicon, use a recent LFortran on `PATH` and the Xcode Command Line Tools.
+Set `MODEL_DIR` to the downloaded MLX 8-bit checkpoint directory (see above), then
+build from the repository root:
+
+```console
+$ lfortran --fast --gpu=metal --gpu-overlap \
+    src-fortran/precision_formats.f90 src-fortran/dense_kernels.f90 \
+    src-fortran/model_io_support.f90 src-fortran/json_tokens.f90 \
+    src-fortran/safetensors_io.f90 src-fortran/qwen_config.f90 \
+    src-fortran/qwen_weights.f90 src-fortran/inference_dump.f90 \
+    src-fortran/dense_model.f90 src-fortran/qwen_tokenizer.f90 \
+    src-fortran/main.f90 -o qwen-fortran-metal
+$ ./qwen-fortran-metal --model "$MODEL_DIR" --no-think \
+    --prompt "Write a Fortran function that returns the n-th Fibonacci number."
+```
+
+This runs inference on the Apple GPU and produces the same Fibonacci function as
+the H200 demo above.
+
+The recorded Apple M4 Max (64 GiB unified memory) steady-decode baseline is
+**3.42 tok/s**, measured over 63 timed tokens in a 64-token fixed-step run;
+model loading and prefill are excluded. This is the initial, unoptimized baseline.
+The tested source revisions were:
+
+- Qwen Fortran `main`: `4ac8c553536a4cdb444d9c757592376220ff7dba`.
+- LFortran `main`: `5d6dcfa371518308306510adf53a88a42de5bc28` (LLVM 11.1.0).
 
 ## CUDA implementation
 
