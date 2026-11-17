@@ -1,7 +1,7 @@
 """Tokenizer tests: qwen_tokenizer.f90 against recorded HF tokenizer output.
 
     python src-fortran/tests/test_tokenizer.py --model DIR [--binary build/fortran-tokenizer/gfortran/test_tokenizer]
-                                               [--qwen-raw PATH] [--regenerate]
+                                               [--regenerate]
 
 Needs the model's tokenizer files (tokenizer.json, generation_config.json,
 ...) in DIR.  Python is stdlib-only; if `tokenizers` is importable the test
@@ -105,7 +105,6 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, type=pathlib.Path)
     ap.add_argument("--binary", default="build/fortran-tokenizer/gfortran/test_tokenizer", type=pathlib.Path)
-    ap.add_argument("--qwen-raw", type=pathlib.Path, help="driver binary; also test its --tokenize/--detokenize modes")
     ap.add_argument("--regenerate", action="store_true")
     ap.add_argument("--fuzz", type=int, default=3000)
     args = ap.parse_args()
@@ -198,19 +197,6 @@ def main():
         dec = decode(args.binary, args.model, id_lists, work)
         bad = [ids for d, ids in zip(dec, id_lists) if d != tk.decode(ids, skip_special_tokens=False).encode()]
         check("decode vs tokenizers (%d random id lists)" % len(id_lists), not bad, repr(bad[:2]))
-    # 9. optional CLI check against the driver binary
-    if args.qwen_raw is not None:
-        r = subprocess.run([str(args.qwen_raw), "--model", str(args.model), "--tokenize", "Hello, world!"],
-                           capture_output=True, text=True, check=True)
-        check("cli --tokenize", json.loads(r.stdout) == data["texts"][3]["ids"], r.stdout)
-        idf = work / "ids.json"
-        idf.write_text(json.dumps([8160, 579, 264, 7047, 1817]))
-        r = subprocess.run([str(args.qwen_raw), "--model", str(args.model), "--detokenize", str(idf)],
-                           capture_output=True, check=True)
-        check("cli --detokenize", r.stdout == b"Here's a thinking process", repr(r.stdout))
-        r = subprocess.run([str(args.qwen_raw), "--model", str(args.model), "--tokenize", "What is the capital of France?", "--chat", "--no-think"],
-                           capture_output=True, text=True, check=True)
-        check("cli --tokenize --chat --no-think", json.loads(r.stdout) == data["chat"][1]["ids"], r.stdout)
     print("%d failure(s)" % len(failures))
     sys.exit(1 if failures else 0)
 
