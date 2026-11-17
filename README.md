@@ -22,7 +22,7 @@ $ hf download lmstudio-community/Qwen3.8-27B-MLX-8bit --local-dir "$MODEL_DIR"
 ```
 
 (`huggingface-cli download` with the same arguments works with older `huggingface_hub`.) All three
-implementations read this directory directly (`--model "$MODEL_DIR"`); it must contain
+implementations read this directory directly (`--model "$MODEL_DIR"`, or `-m` for the CUDA and Fortran programs); it must contain
 `model-0000*-of-00006.safetensors`, `model.safetensors.index.json`, `config.json`, `tokenizer.json`
 and `vocab.json`. Use a local disk: loading takes about 6 s from cache.
 
@@ -46,9 +46,12 @@ of `src-cuda/main.c`. The safetensors, config and JSON readers are in `safetenso
 `qwen_config.f90`, `json_tokens.f90` and `model_io_support.f90`.
 
 ```console
-$ LFORTRAN_LINKER=gcc make fortran-gpu      # needs an LFortran that includes lfortran/lfortran#18012
+$ LFORTRAN_LINKER=gcc make fortran-gpu      # needs a recent LFortran main
 $ ./qwen-fortran-cuda -m "$MODEL_DIR" --no-think \
     -p "What is the capital of France? Answer in one sentence."
+What is the capital of France? Answer in one sentence.
+
+The capital of France is Paris.
 ```
 
 The tokenizer (byte-level BPE, the Qwen pre-tokenizer, NFC normalization and the chat template) is
@@ -61,17 +64,43 @@ ids to stderr. Generation is greedy.
 
 ### NVIDIA GPU
 
-On one H200 NVL:
+Built with LFortran `main` at `5d4680d679`, run on one H200 NVL (the timing lines go to stderr):
 
-```console
+````console
 $ ./qwen-fortran-cuda -m "$MODEL_DIR" --no-think -n 128 \
     -p "Write a Fortran function that returns the n-th Fibonacci number."
-```
+Write a Fortran function that returns the n-th Fibonacci number.
 
-decodes at **about 106 tok/s**; for comparison the CUDA implementation reaches about 120 tok/s.
-The greedy token ids are identical to those of `src-cuda`. The program prints the prompt and streams
-the answer to stdout, and reports the load, prefill and decode times (with tok/s) on stderr. The prompt
-goes through the same single-token forward pass, one token at a time (prefill is not optimized).
+```fortran
+function fib(n) result(f)
+    implicit none
+    integer, intent(in) :: n
+    integer :: f
+    integer :: a, b, i
+
+    if (n <= 0) then
+        f = 0
+    else if (n == 1) then
+        f = 1
+    else
+        a = 0
+        b = 1
+        do i = 2, n
+            f = a + b
+            a = b
+            b = f
+        end do
+    end if
+end function fib
+```
+tokenizer .1 s, weights + state in 6.2 s, prompt 25 tokens
+prefill: 25 tokens in .878 s (28.5 tok/s); decode: 126 tokens in 1.187 s (106.1 tok/s)
+````
+
+Decode speed on one H200 NVL: **about 106 tok/s** (3 runs: 106.1 tok/s each); for comparison the CUDA
+implementation reaches about 120 tok/s. The greedy token ids are identical to those of `src-cuda`.
+The prompt goes through the same single-token forward pass, one token at a time (prefill is not
+optimized).
 See [`src-fortran/README.md`](src-fortran/README.md).
 
 ### Apple GPU (Metal)
