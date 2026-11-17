@@ -252,12 +252,12 @@ contains
 
     ! ------------------------------------------------------------ full attention
     ! y = [q|gate per head (nq*512) | k (nkv*256) | v (nkv*256)]. q and k get an RMSNorm and a
-    ! rotate-half RoPE on their first 64 dims (cos/sin: rc, rs of the 32 frequencies).
+    ! rotate-half RoPE on their first 64 dims (cos/sin of the 32 angles of position t: rc(:, t+1), rs(:, t+1)).
 
     ! The q heads and the k head (RMSNorm, RoPE) of position p: q into qr (scaled by 1/sqrt(256)), k and
     ! v appended to the caches. Head hh = 1..nq is a q head, nq+1..nq+nkv a k head.
     subroutine attn_qkv(y, qw, kw, rc, rs, eps, p, qr, kc, vc)
-        real, intent(in) :: y(:), qw(:), kw(:), rc(:), rs(:), eps
+        real, intent(in) :: y(:), qw(:), kw(:), rc(:,:), rs(:,:), eps
         integer, intent(in) :: p
         real, intent(inout) :: qr(:,:), kc(:,:,:), vc(:,:,:)
         integer :: nq, nkv
@@ -277,9 +277,9 @@ contains
                     ss = ss + y(b+j) * y(b+j)
                 end do
                 if (d <= 32) then   ! rotate-half RoPE on dims 1..64: pairs (d, d+32)
-                    dp = d + 32; cs = rc(d); sn = -rs(d)
+                    dp = d + 32; cs = rc(d,p+1); sn = -rs(d,p+1)
                 else if (d <= 64) then
-                    dp = d - 32; cs = rc(d-32); sn = rs(d-32)
+                    dp = d - 32; cs = rc(d-32,p+1); sn = rs(d-32,p+1)
                 else
                     dp = d; cs = 1; sn = 0
                 end if
