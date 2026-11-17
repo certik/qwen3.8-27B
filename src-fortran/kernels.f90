@@ -6,7 +6,7 @@
 ! fused into the GEMVs. The residual stream and its RMSNorm (as `resid` in model.h):
 !   x    residual (H)
 !   xw   x * (weight of the RMSNorm that comes next), the input of the next GEMV
-!   ssp  sum of x**2 in parts: ssp(i) = x(2i-1)**2 + x(2i)**2
+!   ssp  sum of x**2 in parts: ssp(i) = x(4i-3)**2 + ... + x(4i)**2
 ! The GEMV that updates x (gemv_resid, embed) writes all three. The GEMV that consumes the norm
 ! (gemv_norm) adds up ssp alongside its dot products and multiplies its rows by rsqrt(sum/H + eps),
 ! which gives W (rmsnorm(x) * weight). (CUDA accumulates the sum with atomics instead of parts.)
@@ -72,12 +72,16 @@ contains
         integer, intent(in) :: tok
         real, intent(in) :: wn(:)
         real, intent(inout) :: x(:), xw(:), ssp(:)
-        do concurrent (integer :: i = 1:size(x)/2)
-            x(2*i-1) = q8(w, s, b, 2*i-1, tok+1)
-            x(2*i) = q8(w, s, b, 2*i, tok+1)
-            xw(2*i-1) = x(2*i-1) * wn(2*i-1)
-            xw(2*i) = x(2*i) * wn(2*i)
-            ssp(i) = x(2*i-1)*x(2*i-1) + x(2*i)*x(2*i)
+        do concurrent (integer :: i = 1:size(x)/4)
+            x(4*i-3) = q8(w, s, b, 4*i-3, tok+1)
+            x(4*i-2) = q8(w, s, b, 4*i-2, tok+1)
+            x(4*i-1) = q8(w, s, b, 4*i-1, tok+1)
+            x(4*i) = q8(w, s, b, 4*i, tok+1)
+            xw(4*i-3) = x(4*i-3) * wn(4*i-3)
+            xw(4*i-2) = x(4*i-2) * wn(4*i-2)
+            xw(4*i-1) = x(4*i-1) * wn(4*i-1)
+            xw(4*i) = x(4*i) * wn(4*i)
+            ssp(i) = (x(4*i-3)*x(4*i-3) + x(4*i-2)*x(4*i-2)) + (x(4*i-1)*x(4*i-1) + x(4*i)*x(4*i))
         end do
     end subroutine
 
@@ -115,8 +119,7 @@ contains
                 n = 4*i - 3
                 a1 = 0; a2 = 0; a3 = 0; a4 = 0; ss = 0
                 do c = 1, size(w, 1)/4
-                    ss = ss + (((ssp(8*c-7) + ssp(8*c-6)) + (ssp(8*c-5) + ssp(8*c-4))) &
-                       + ((ssp(8*c-3) + ssp(8*c-2)) + (ssp(8*c-1) + ssp(8*c))))
+                    ss = ss + ((ssp(4*c-3) + ssp(4*c-2)) + (ssp(4*c-1) + ssp(4*c)))
                     a1 = a1 + qdot(w, s, b, xw, n, c)
                     a2 = a2 + qdot(w, s, b, xw, n+1, c)
                     a3 = a3 + qdot(w, s, b, xw, n+2, c)
@@ -162,8 +165,7 @@ contains
                 xw(n+1) = x(n+1) * wnext(n+1)
                 xw(n+2) = x(n+2) * wnext(n+2)
                 xw(n+3) = x(n+3) * wnext(n+3)
-                ssp(2*i-1) = x(n)*x(n) + x(n+1)*x(n+1)
-                ssp(2*i) = x(n+2)*x(n+2) + x(n+3)*x(n+3)
+                ssp(i) = (x(n)*x(n) + x(n+1)*x(n+1)) + (x(n+2)*x(n+2) + x(n+3)*x(n+3))
             end block
         end do
     end subroutine

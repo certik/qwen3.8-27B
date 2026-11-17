@@ -204,7 +204,7 @@ contains
         integer, intent(in) :: max_ctx
         integer :: l, j, t
         associate (c => w%c)
-            allocate(s%x(c%hidden), s%xw(c%hidden), s%ssp(c%hidden/2), s%mid(c%intermediate), s%logits(c%vocab), &
+            allocate(s%x(c%hidden), s%xw(c%hidden), s%ssp(c%hidden/4), s%mid(c%intermediate), s%logits(c%vocab), &
                 s%y(max(2*c%intermediate, c%conv_dim + c%linear_value_dim + 2*c%linear_value_heads, &
                         2*c%query_dim + 2*c%kv_dim)), &
                 s%o(max(c%linear_value_dim, c%query_dim)), s%qkv(c%conv_dim), &
