@@ -17,7 +17,7 @@ module kernels
     use, intrinsic :: iso_fortran_env, only: int16, int32
     implicit none
     private
-    public :: qmat, bf, embed, gemv_norm, gemv_resid, gdn_conv, gdn_step, gdn_norm
+    public :: qmat, bf, embed, gemv_norm, gemv_resid, gdn_conv, gdn_step, gdn_norm, gdn_all, attn_all, argmax_final
     public :: attn_qkv, attn_scores, attn_out, argmax_part
 
     ! One MLX affine 8-bit matrix (group size 64) in the checkpoint's own layout: w(:, n) holds the K
@@ -66,22 +66,22 @@ contains
     end function
 
     ! x = E(:, tok); xw = x * wn; ssp
-    subroutine embed(w, s, b, tok, wn, x, xw, ssp)
+    subroutine embed(w, s, b, tokbuf, wn, k, x, xw, ssp)
         integer(int32), intent(in) :: w(:,:)
         integer(int16), intent(in) :: s(:,:), b(:,:)
-        integer, intent(in) :: tok
+        integer, intent(in) :: tokbuf(:), k
         real, intent(in) :: wn(:)
         real, intent(inout) :: x(:), xw(:), ssp(:)
         do concurrent (integer :: i = 1:size(x)/4)
-            x(4*i-3) = q8(w, s, b, 4*i-3, tok+1)
-            x(4*i-2) = q8(w, s, b, 4*i-2, tok+1)
-            x(4*i-1) = q8(w, s, b, 4*i-1, tok+1)
-            x(4*i) = q8(w, s, b, 4*i, tok+1)
+            x(4*i-3) = q8(w, s, b, 4*i-3, tokbuf(1)+1)
+            x(4*i-2) = q8(w, s, b, 4*i-2, tokbuf(1)+1)
+            x(4*i-1) = q8(w, s, b, 4*i-1, tokbuf(1)+1)
+            x(4*i) = q8(w, s, b, 4*i, tokbuf(1)+1)
             xw(4*i-3) = x(4*i-3) * wn(4*i-3)
             xw(4*i-2) = x(4*i-2) * wn(4*i-2)
             xw(4*i-1) = x(4*i-1) * wn(4*i-1)
             xw(4*i) = x(4*i) * wn(4*i)
-            ssp(i) = (x(4*i-3)*x(4*i-3) + x(4*i-2)*x(4*i-2)) + (x(4*i-1)*x(4*i-1) + x(4*i)*x(4*i))
+            ssp(i+k-1) = (x(4*i-3)*x(4*i-3) + x(4*i-2)*x(4*i-2)) + (x(4*i-1)*x(4*i-1) + x(4*i)*x(4*i))
         end do
     end subroutine
 
@@ -106,20 +106,21 @@ contains
 
     ! y = rsqrt(sum(ssp)/H + eps) * (W xw). swiglu: the rows are interleaved gate/up pairs
     ! (g1 g2 u1 u2 g3 g4 u3 u4 ...) and y(i) = silu(gate_i) * up_i, for N/2 outputs.
-    subroutine gemv_norm(w, s, b, xw, ssp, eps, swiglu, y)
+    subroutine gemv_norm(w, s, b, xw, ssp, k, eps, swiglu, y)
         integer(int32), intent(in) :: w(:,:)
         integer(int16), intent(in) :: s(:,:), b(:,:)
         real, intent(in) :: xw(:), ssp(:), eps
         logical, intent(in) :: swiglu
+        integer, intent(in) :: k
         real, intent(inout) :: y(:)
         do concurrent (integer :: i = 1:size(w, 2)/4)
             block
                 real :: a1, a2, a3, a4, ss, r
                 integer :: c, n
                 n = 4*i - 3
-                a1 = 0; a2 = 0; a3 = 0; a4 = 0; ss = 0
+                a1 = 0; a2 = 0; a3 = 0; a4 = 0
+                ss = ssp(k)
                 do c = 1, size(w, 1)/4
-                    ss = ss + ((ssp(4*c-3) + ssp(4*c-2)) + (ssp(4*c-1) + ssp(4*c)))
                     a1 = a1 + qdot(w, s, b, xw, n, c)
                     a2 = a2 + qdot(w, s, b, xw, n+1, c)
                     a3 = a3 + qdot(w, s, b, xw, n+2, c)
@@ -140,10 +141,11 @@ contains
     end subroutine
 
     ! x += W v; then xw = x * wnext and ssp, for the next RMSNorm (weight wnext)
-    subroutine gemv_resid(w, s, b, v, wnext, x, xw, ssp)
+    subroutine gemv_resid(w, s, b, v, wnext, k, x, xw, ssp)
         integer(int32), intent(in) :: w(:,:)
         integer(int16), intent(in) :: s(:,:), b(:,:)
         real, intent(in) :: v(:), wnext(:)
+        integer, intent(in) :: k
         real, intent(inout) :: x(:), xw(:), ssp(:)
         do concurrent (integer :: i = 1:size(w, 2)/4)
             block
@@ -165,7 +167,7 @@ contains
                 xw(n+1) = x(n+1) * wnext(n+1)
                 xw(n+2) = x(n+2) * wnext(n+2)
                 xw(n+3) = x(n+3) * wnext(n+3)
-                ssp(i) = (x(n)*x(n) + x(n+1)*x(n+1)) + (x(n+2)*x(n+2) + x(n+3)*x(n+3))
+                ssp(i+k-1) = (x(n)*x(n) + x(n+1)*x(n+1)) + (x(n+2)*x(n+2) + x(n+3)*x(n+3))
             end block
         end do
     end subroutine
@@ -249,6 +251,36 @@ contains
                     out((h-1)*GD + v) = o(v,h) * r * nw(v) * z * sigmoid(z)
                 end do
             end block
+        end do
+    end subroutine
+
+    ! HACK placeholder: one block of 256 threads per value head; the generated body is replaced by
+    ! src-cuda's gdn_kernel (adapted to 256 threads). cs: conv inputs, double buffered by position parity.
+    subroutine gdn_all(y, cw, a_log, dt_bias, nw, nk, pos, eps, cs, st, out)
+        real, intent(in) :: y(:), cw(:,:), a_log(:), dt_bias(:), nw(:), eps
+        integer, intent(in) :: nk, pos
+        real, intent(inout) :: cs(:,:), st(:,:,:), out(:)
+        do concurrent (integer :: i = 1:size(st, 3)*256)
+            if (i < 0) then
+                out(1) = y(1) + cw(1,1) + a_log(1) + dt_bias(1) + nw(1) + eps + nk + pos + cs(1,1) + st(1,1,1)
+                cs(1,1) = 0
+                st(1,1,1) = 0
+            end if
+        end do
+    end subroutine
+
+    ! HACK placeholder: 8 blocks of 256 threads per kv head; the generated body is replaced by src-cuda's
+    ! attention_kernel. kc and vc: kc(d, kh, t), vc(d, kh, t).
+    subroutine attn_all(y, qw, kw, rc, rs, eps, p, kc, vc, out)
+        real, intent(in) :: y(:), qw(:), kw(:), rc(:,:), rs(:,:), eps
+        integer, intent(in) :: p
+        real, intent(inout) :: kc(:,:,:), vc(:,:,:), out(:)
+        do concurrent (integer :: i = 1:size(kc, 2)*8*256)
+            if (i < 0) then
+                out(1) = y(1) + qw(1) + kw(1) + rc(1,1) + rs(1,1) + eps + p + kc(1,1,1) + vc(1,1,1)
+                kc(1,1,1) = 0
+                vc(1,1,1) = 0
+            end if
         end do
     end subroutine
 
@@ -376,6 +408,29 @@ contains
                 end do
                 pv(i) = m
                 pi(i) = bi
+            end block
+        end do
+    end subroutine
+
+    ! HACK: the token of the largest of the parts (pv, pi) into tokbuf(1) (for the next embed) and hist(pos+1)
+    subroutine argmax_final(pv, pi, np, pos, tokbuf, hist)
+        real, intent(in) :: pv(:)
+        integer, intent(in) :: pi(:), np, pos
+        integer, intent(inout) :: tokbuf(:), hist(:)
+        do concurrent (integer :: i = 1:1)
+            block
+                real :: m
+                integer :: j, bi
+                m = -huge(m)
+                do j = 1, np
+                    m = max(m, pv(j))
+                end do
+                bi = huge(bi)
+                do j = 1, np
+                    if (pv(j) == m) bi = min(bi, pi(j))
+                end do
+                tokbuf(i) = bi - 1
+                hist(pos+i) = bi - 1
             end block
         end do
     end subroutine

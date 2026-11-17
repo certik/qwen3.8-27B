@@ -1,0 +1,8 @@
+#!/bin/bash
+# nvccwrap: nvcc that first applies $LF_PATCH (a python script taking the .cu path) to every .cu input
+if [ -n "$LF_PATCH" ]; then
+  for a in "$@"; do
+    case "$a" in *.cu) python3 "$LF_PATCH" "$a" || exit 1;; esac
+  done
+fi
+exec nvcc "$@"
