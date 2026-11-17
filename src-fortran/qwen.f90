@@ -52,7 +52,7 @@ module model
         real, allocatable :: x(:), xw(:), ssp(:)     ! residual stream, x * next norm weight, sum x**2 parts
         real, allocatable :: y(:), o(:), mid(:), logits(:)
         real, allocatable :: qkv(:), go(:,:)         ! Gated DeltaNet
-        real, allocatable :: qr(:,:), sc(:,:), rc(:), rs(:)   ! attention: q heads, scores, RoPE cos/sin
+        real, allocatable :: qr(:,:), sc(:,:), rc(:,:), rs(:,:)   ! attention: q heads, scores, RoPE cos/sin
         real, allocatable :: pv(:)                   ! argmax parts (see np)
         integer, allocatable :: pi(:)
         type(layer_state) :: l(max_layers)
@@ -202,15 +202,23 @@ contains
         type(weights), intent(in) :: w
         type(state), intent(out) :: s
         integer, intent(in) :: max_ctx
-        integer :: l
+        integer :: l, j, t
         associate (c => w%c)
-            allocate(s%x(c%hidden), s%xw(c%hidden), s%ssp(c%hidden/2), s%mid(c%intermediate), s%logits(c%vocab), &
+            allocate(s%x(c%hidden), s%xw(c%hidden), s%ssp(c%hidden/4), s%mid(c%intermediate), s%logits(c%vocab), &
                 s%y(max(2*c%intermediate, c%conv_dim + c%linear_value_dim + 2*c%linear_value_heads, &
                         2*c%query_dim + 2*c%kv_dim)), &
                 s%o(max(c%linear_value_dim, c%query_dim)), s%qkv(c%conv_dim), &
                 s%go(c%linear_value_head_dim, c%linear_value_heads), &
-                s%qr(c%head_dim, c%query_heads), s%sc(max_ctx, c%query_heads), s%rc(pad(c%rotary_dim/2)), s%rs(pad(c%rotary_dim/2)), &
+                s%qr(c%head_dim, c%query_heads), s%sc(max_ctx, c%query_heads), s%rc(c%rotary_dim/2, max_ctx), s%rs(c%rotary_dim/2, max_ctx), &
                 s%pv(np), s%pi(np))
+            do t = 1, max_ctx   ! RoPE angles of the positions t - 1
+                do j = 1, c%rotary_dim/2
+                    s%rc(j,t) = real(cos(mod((t-1) * real(c%rope_theta, real64)**(-2.0_real64*(j-1)/c%rotary_dim), &
+                        6.283185307179586_real64)))
+                    s%rs(j,t) = real(sin(mod((t-1) * real(c%rope_theta, real64)**(-2.0_real64*(j-1)/c%rotary_dim), &
+                        6.283185307179586_real64)))
+                end do
+            end do
             do l = 1, c%layers
                 if (w%l(l)%linear) then
                     allocate(s%l(l)%conv(c%conv_dim, c%conv_kernel-1), s%l(l)%ssm(c%linear_key_head_dim, &
@@ -230,16 +238,9 @@ contains
         type(weights), intent(in) :: w
         type(state), intent(inout) :: s
         integer, intent(in) :: tok, pos
-        real, parameter :: two_pi = 6.283185307179586
         integer :: l, j
         real :: best
         associate (c => w%c)
-            do j = 1, c%rotary_dim/2   ! RoPE angles of this position
-                s%rc(j) = real(cos(mod(pos * real(c%rope_theta, real64)**(-2.0_real64*(j-1)/c%rotary_dim), &
-                    real(two_pi, real64))))
-                s%rs(j) = real(sin(mod(pos * real(c%rope_theta, real64)**(-2.0_real64*(j-1)/c%rotary_dim), &
-                    real(two_pi, real64))))
-            end do
             call embed(w%embed%w, w%embed%s, w%embed%b, tok, w%l(1)%in_norm, s%x, s%xw, s%ssp)
             do l = 1, c%layers
                 associate (y => w%l(l), t => s%l(l))
