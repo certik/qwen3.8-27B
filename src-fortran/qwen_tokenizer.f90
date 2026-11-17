@@ -10,8 +10,6 @@
 !   (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}|
 !   ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
 ! is implemented by hand as a state machine over code points (piece_end).
-!
-! Known limits: see the README section "Tokenizer".
 module qwen_unicode_data
     use, intrinsic :: iso_fortran_env, only: int32
     implicit none
