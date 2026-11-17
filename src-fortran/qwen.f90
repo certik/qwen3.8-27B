@@ -49,7 +49,9 @@ module model
     end type
 
     type :: state
-        real, allocatable :: x(:), xw(:), ssp(:)     ! residual stream, x * next norm weight, sum x**2 parts
+        real, allocatable :: x(:), xw(:)     ! residual stream, x * next norm weight
+        integer(int64), allocatable :: ss(:) ! sum x**2 in fixed point (scale 2**24), in slot k of two (padded)
+        integer :: k = 1
         real, allocatable :: y(:), o(:), mid(:), logits(:)
         real, allocatable :: qkv(:), go(:,:)         ! Gated DeltaNet
         real, allocatable :: qr(:,:), sc(:,:), rc(:,:), rs(:,:)   ! attention: q heads, scores, RoPE cos/sin
@@ -204,13 +206,14 @@ contains
         integer, intent(in) :: max_ctx
         integer :: l, j, t
         associate (c => w%c)
-            allocate(s%x(c%hidden), s%xw(c%hidden), s%ssp(c%hidden/4), s%mid(c%intermediate), s%logits(c%vocab), &
+            allocate(s%x(c%hidden), s%xw(c%hidden), s%ss(pad(2)), s%mid(c%intermediate), s%logits(c%vocab), &
                 s%y(max(2*c%intermediate, c%conv_dim + c%linear_value_dim + 2*c%linear_value_heads, &
                         2*c%query_dim + 2*c%kv_dim)), &
                 s%o(max(c%linear_value_dim, c%query_dim)), s%qkv(c%conv_dim), &
                 s%go(c%linear_value_head_dim, c%linear_value_heads), &
                 s%qr(c%head_dim, c%query_heads), s%sc(max_ctx, c%query_heads), s%rc(c%rotary_dim/2, max_ctx), s%rs(c%rotary_dim/2, max_ctx), &
                 s%pv(np), s%pi(np))
+            s%ss = 0
             do t = 1, max_ctx   ! RoPE angles of the positions t - 1
                 do j = 1, c%rotary_dim/2
                     s%rc(j,t) = real(cos(mod((t-1) * real(c%rope_theta, real64)**(-2.0_real64*(j-1)/c%rotary_dim), &
@@ -241,10 +244,11 @@ contains
         integer :: l, j
         real :: best
         associate (c => w%c)
-            call embed(w%embed%w, w%embed%s, w%embed%b, tok, w%l(1)%in_norm, s%x, s%xw, s%ssp)
+            s%k = 3 - s%k
+            call embed(w%embed%w, w%embed%s, w%embed%b, tok, w%l(1)%in_norm, s%x, s%xw, s%ss, s%k)
             do l = 1, c%layers
                 associate (y => w%l(l), t => s%l(l))
-                    call k_gemv_norm(y%in_proj, s%xw, s%ssp, c%rms_eps, .false., s%y)   ! y = W_in rmsnorm(x)
+                    call k_gemv_norm(y%in_proj, s%xw, s%ss, s%k, c%rms_eps, .false., s%y)   ! y = W_in rmsnorm(x)
                     if (y%linear) then   ! Gated DeltaNet
                         call gdn_conv(s%y, y%conv_w, t%conv, s%qkv)
                         call gdn_step(s%qkv, s%y, y%a_log, y%dt_bias, c%linear_key_heads, t%ssm, s%go)
@@ -254,16 +258,18 @@ contains
                         call attn_scores(s%qr, t%kc, pos + 1, s%sc)
                         call attn_out(s%y, s%sc, t%vc, pos + 1, s%o)
                     end if
-                    call k_gemv_resid(y%out_proj, s%o, y%post_norm, s%x, s%xw, s%ssp)                ! x += W_out o
-                    call k_gemv_norm(y%gate_up, s%xw, s%ssp, c%rms_eps, .true., s%mid)          ! mid = silu(gate) * up
+                    s%k = 3 - s%k
+                    call k_gemv_resid(y%out_proj, s%o, y%post_norm, s%x, s%xw, s%ss, s%k)                ! x += W_out o
+                    call k_gemv_norm(y%gate_up, s%xw, s%ss, s%k, c%rms_eps, .true., s%mid)          ! mid = silu(gate) * up
+                    s%k = 3 - s%k
                     if (l < c%layers) then
-                        call k_gemv_resid(y%down, s%mid, w%l(l+1)%in_norm, s%x, s%xw, s%ssp)         ! x += W_down mid
+                        call k_gemv_resid(y%down, s%mid, w%l(l+1)%in_norm, s%x, s%xw, s%ss, s%k)         ! x += W_down mid
                     else
-                        call k_gemv_resid(y%down, s%mid, w%final_norm, s%x, s%xw, s%ssp)
+                        call k_gemv_resid(y%down, s%mid, w%final_norm, s%x, s%xw, s%ss, s%k)
                     end if
                 end associate
             end do
-            call k_gemv_norm(w%lm_head, s%xw, s%ssp, c%rms_eps, .false., s%logits)
+            call k_gemv_norm(w%lm_head, s%xw, s%ss, s%k, c%rms_eps, .false., s%logits)
             call argmax_part(s%logits, np, s%pv, s%pi)
             best = s%pv(1)   ! the largest logit, at its first index
             next = s%pi(1)
@@ -277,19 +283,23 @@ contains
         end associate
     end function
 
-    subroutine k_gemv_norm(m, xw, ssp, eps, swiglu, y)
+    subroutine k_gemv_norm(m, xw, ss, k, eps, swiglu, y)
         type(qmat), intent(in) :: m
-        real, intent(in) :: xw(:), ssp(:), eps
+        real, intent(in) :: xw(:), eps
+        integer(int64), intent(inout) :: ss(:)
+        integer, intent(in) :: k
         logical, intent(in) :: swiglu
         real, intent(inout) :: y(:)
-        call gemv_norm(m%w, m%s, m%b, xw, ssp, eps, swiglu, y)
+        call gemv_norm(m%w, m%s, m%b, xw, ss, k, eps, swiglu, y)
     end subroutine
 
-    subroutine k_gemv_resid(m, v, wnext, x, xw, ssp)
+    subroutine k_gemv_resid(m, v, wnext, x, xw, ss, k)
         type(qmat), intent(in) :: m
         real, intent(in) :: v(:), wnext(:)
-        real, intent(inout) :: x(:), xw(:), ssp(:)
-        call gemv_resid(m%w, m%s, m%b, v, wnext, x, xw, ssp)
+        real, intent(inout) :: x(:), xw(:)
+        integer(int64), intent(inout) :: ss(:)
+        integer, intent(in) :: k
+        call gemv_resid(m%w, m%s, m%b, v, wnext, x, xw, ss, k)
     end subroutine
 
 end module model

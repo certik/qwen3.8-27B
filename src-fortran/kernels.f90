@@ -14,7 +14,7 @@
 ! In a do concurrent over 2 or 3 indices the last one varies fastest between GPU threads. An inner
 ! sequential loop that only accumulates into scalars is shared out over the 32 lanes of a warp.
 module kernels
-    use, intrinsic :: iso_fortran_env, only: int16, int32
+    use, intrinsic :: iso_fortran_env, only: int16, int32, int64, real64
     implicit none
     private
     public :: qmat, bf, embed, gemv_norm, gemv_resid, gdn_conv, gdn_step, gdn_norm
@@ -65,14 +65,15 @@ contains
         q8 = ibits(w((k-1)/4+1, n), 8*modulo(k-1, 4), 8) * bf(s((k-1)/64+1, n)) + bf(b((k-1)/64+1, n))
     end function
 
-    ! x = E(:, tok); xw = x * wn; ssp
-    subroutine embed(w, s, b, tok, wn, x, xw, ssp)
+    ! x = E(:, tok); xw = x * wn; ss(k) += sum(x**2) in fixed point (scale 2**24)
+    subroutine embed(w, s, b, tok, wn, x, xw, ss, k)
         integer(int32), intent(in) :: w(:,:)
         integer(int16), intent(in) :: s(:,:), b(:,:)
-        integer, intent(in) :: tok
+        integer, intent(in) :: tok, k
         real, intent(in) :: wn(:)
-        real, intent(inout) :: x(:), xw(:), ssp(:)
-        do concurrent (integer :: i = 1:size(x)/4)
+        real, intent(inout) :: x(:), xw(:)
+        integer(int64), intent(inout) :: ss(:)
+        do concurrent (integer :: i = 1:size(x)/4) reduce(+: ss)
             x(4*i-3) = q8(w, s, b, 4*i-3, tok+1)
             x(4*i-2) = q8(w, s, b, 4*i-2, tok+1)
             x(4*i-1) = q8(w, s, b, 4*i-1, tok+1)
@@ -81,7 +82,8 @@ contains
             xw(4*i-2) = x(4*i-2) * wn(4*i-2)
             xw(4*i-1) = x(4*i-1) * wn(4*i-1)
             xw(4*i) = x(4*i) * wn(4*i)
-            ssp(i) = (x(4*i-3)*x(4*i-3) + x(4*i-2)*x(4*i-2)) + (x(4*i-1)*x(4*i-1) + x(4*i)*x(4*i))
+            ss(k) = ss(k) + nint(((x(4*i-3)*x(4*i-3) + x(4*i-2)*x(4*i-2)) + (x(4*i-1)*x(4*i-1) + x(4*i)*x(4*i))) &
+                * 2.0**24, int64)
         end do
     end subroutine
 
@@ -106,26 +108,27 @@ contains
 
     ! y = rsqrt(sum(ssp)/H + eps) * (W xw). swiglu: the rows are interleaved gate/up pairs
     ! (g1 g2 u1 u2 g3 g4 u3 u4 ...) and y(i) = silu(gate_i) * up_i, for N/2 outputs.
-    subroutine gemv_norm(w, s, b, xw, ssp, eps, swiglu, y)
+    subroutine gemv_norm(w, s, b, xw, ss, k, eps, swiglu, y)
         integer(int32), intent(in) :: w(:,:)
         integer(int16), intent(in) :: s(:,:), b(:,:)
-        real, intent(in) :: xw(:), ssp(:), eps
+        real, intent(in) :: xw(:), eps
+        integer(int64), intent(inout) :: ss(:)
+        integer, intent(in) :: k
         logical, intent(in) :: swiglu
         real, intent(inout) :: y(:)
         do concurrent (integer :: i = 1:size(w, 2)/4)
             block
-                real :: a1, a2, a3, a4, ss, r
+                real :: a1, a2, a3, a4, r
                 integer :: c, n
                 n = 4*i - 3
-                a1 = 0; a2 = 0; a3 = 0; a4 = 0; ss = 0
+                a1 = 0; a2 = 0; a3 = 0; a4 = 0
                 do c = 1, size(w, 1)/4
-                    ss = ss + ((ssp(4*c-3) + ssp(4*c-2)) + (ssp(4*c-1) + ssp(4*c)))
                     a1 = a1 + qdot(w, s, b, xw, n, c)
                     a2 = a2 + qdot(w, s, b, xw, n+1, c)
                     a3 = a3 + qdot(w, s, b, xw, n+2, c)
                     a4 = a4 + qdot(w, s, b, xw, n+3, c)
                 end do
-                r = 1 / sqrt(ss / size(xw) + eps)
+                r = 1 / sqrt(real(real(ss(k), real64) / 2.0_real64**24) / size(xw) + eps)
                 if (swiglu) then
                     y(2*i-1) = a1 * r * sigmoid(a1 * r) * (a3 * r)
                     y(2*i) = a2 * r * sigmoid(a2 * r) * (a4 * r)
@@ -135,17 +138,20 @@ contains
                     y(n+2) = a3 * r
                     y(n+3) = a4 * r
                 end if
+                if (i == 1) ss(3 - k) = 0   ! the other slot, for the next producer of x
             end block
         end do
     end subroutine
 
     ! x += W v; then xw = x * wnext and ssp, for the next RMSNorm (weight wnext)
-    subroutine gemv_resid(w, s, b, v, wnext, x, xw, ssp)
+    subroutine gemv_resid(w, s, b, v, wnext, x, xw, ss, k)
         integer(int32), intent(in) :: w(:,:)
         integer(int16), intent(in) :: s(:,:), b(:,:)
         real, intent(in) :: v(:), wnext(:)
-        real, intent(inout) :: x(:), xw(:), ssp(:)
-        do concurrent (integer :: i = 1:size(w, 2)/4)
+        real, intent(inout) :: x(:), xw(:)
+        integer(int64), intent(inout) :: ss(:)
+        integer, intent(in) :: k
+        do concurrent (integer :: i = 1:size(w, 2)/4) reduce(+: ss)
             block
                 real :: a1, a2, a3, a4
                 integer :: c, n
@@ -165,7 +171,7 @@ contains
                 xw(n+1) = x(n+1) * wnext(n+1)
                 xw(n+2) = x(n+2) * wnext(n+2)
                 xw(n+3) = x(n+3) * wnext(n+3)
-                ssp(i) = (x(n)*x(n) + x(n+1)*x(n+1)) + (x(n+2)*x(n+2) + x(n+3)*x(n+3))
+                ss(k) = ss(k) + nint(((x(n)*x(n) + x(n+1)*x(n+1)) + (x(n+2)*x(n+2) + x(n+3)*x(n+3))) * 2.0**24, int64)
             end block
         end do
     end subroutine
