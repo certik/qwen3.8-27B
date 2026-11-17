@@ -4,26 +4,23 @@ module safetensors_io
     use json_tokens
     implicit none
     private
-    public :: tensor_info, shard_info, tensor_archive, inspect_shard, open_archive, find_tensor
+    public :: tensor_archive, open_archive, find_tensor
     public :: read_bf16, read_u32
 
     type :: tensor_info
         character(:), allocatable :: name, path, dtype
         integer(int64), allocatable :: shape(:)
         integer(int64) :: byte_offset=0, nbytes=0, elements=0
-        integer :: shard=0
     end type
     type :: shard_info
         character(:), allocatable :: path
-        integer(int64) :: file_bytes=0, header_bytes=0
     end type
     type :: tensor_archive
         type(tensor_info), allocatable :: tensor(:)
-        type(shard_info), allocatable :: shard(:)
     end type
 
     interface read_bf16
-        module procedure read_bf16_flat, read_bf16_matrix, read_bf16_cube
+        module procedure read_bf16_flat, read_bf16_matrix
     end interface
     interface read_u32
         module procedure read_u32_flat, read_u32_matrix
@@ -31,29 +28,27 @@ module safetensors_io
 
 contains
 
-    subroutine inspect_shard(path, tensors, shard, error)
+    subroutine inspect_shard(path, tensors, error)
         character(*), intent(in) :: path
         type(tensor_info), allocatable, intent(out) :: tensors(:)
-        type(shard_info), intent(out) :: shard
         type(io_error), intent(out) :: error
         type(json_document) :: doc
         character(8) :: prefix
         character(:), allocatable :: header
         integer :: unit, ios, i, j, key, info, arr, off, count, item_bytes, k, metadata
         integer, allocatable :: order(:)
-        integer(int64) :: length, base, lo, hi, bytes, dim, finish, cursor
+        integer(int64) :: file_bytes, length, base, lo, hi, bytes, dim, finish, cursor
         call require_byte_io(error)
         if (error%failed()) return
-        shard%path=path
         open(newunit=unit, file=path, status='old', access='stream', form='unformatted', action='read', iostat=ios)
         if (ios /= 0) then
             call fail(error, 'cannot open safetensors shard: '//path)
             return
         end if
-        inquire(unit=unit, size=shard%file_bytes, iostat=ios)
+        inquire(unit=unit, size=file_bytes, iostat=ios)
         if (ios /= 0) then
             call fail(error, 'cannot inquire shard size: '//path)
-        else if (shard%file_bytes < 8) then
+        else if (file_bytes < 8) then
             call fail(error, 'truncated safetensors length prefix: '//path)
         end if
         if (.not. error%failed()) then
@@ -69,7 +64,7 @@ contains
                 end do
             end do
             if (length < 2 .or. length > max_json_bytes) call fail(error, 'safetensors header length outside 2..16 MiB')
-            if (length > shard%file_bytes-8) call fail(error, 'truncated safetensors header: '//path)
+            if (length > file_bytes-8) call fail(error, 'truncated safetensors header: '//path)
         end if
         if (.not. error%failed()) then
             allocate(character(int(length)) :: header, stat=ios)
@@ -82,7 +77,6 @@ contains
         end if
         close(unit)
         if (error%failed()) return
-        shard%header_bytes=length
         base=8+length
         call parse_json(header, doc, error)
         if (error%failed()) return
@@ -167,7 +161,7 @@ contains
             lo=json_integer(doc,element(doc,off,1),error)
             hi=json_integer(doc,element(doc,off,2),error)
             if (error%failed()) return
-            if (lo < 0 .or. hi < lo .or. hi > shard%file_bytes-base) then
+            if (lo < 0 .or. hi < lo .or. hi > file_bytes-base) then
                 call fail(error, 'tensor data_offsets outside shard: '//tensors(i)%name)
                 return
             end if
@@ -202,7 +196,7 @@ contains
             if (error%failed()) return
             cursor=finish
         end do
-        if (cursor /= shard%file_bytes) call fail(error, 'unindexed trailing safetensors data')
+        if (cursor /= file_bytes) call fail(error, 'unindexed trailing safetensors data')
     end subroutine
 
     subroutine open_archive(directory, archive, error)
@@ -268,15 +262,10 @@ contains
             mapping(i)=s
             key=doc%token(key+1)%next
         end do
-        allocate(archive%shard(ns),stat=ios)
-        if (ios /= 0) then
-            call fail(error, 'archive shard allocation failed')
-            return
-        end if
         nt=0
         payload_bytes=0
         do s=1,ns
-            call inspect_shard(shards(s)%path,tensors,archive%shard(s),error)
+            call inspect_shard(shards(s)%path,tensors,error)
             if (error%failed()) return
             do j=1,size(tensors)
                 index=find_tensor(archive,tensors(j)%name)
@@ -293,7 +282,6 @@ contains
                     return
                 end if
                 archive%tensor(index)=tensors(j)
-                archive%tensor(index)%shard=s
                 seen(index)=.true.
                 nt=nt+1
                 payload_bytes=checked_add(payload_bytes,tensors(j)%nbytes,error)
@@ -336,14 +324,14 @@ contains
         end do
     end function
 
-    subroutine payload_unit(tensor, dtype, first, count, unit, position, error)
+    subroutine payload_unit(tensor, dtype, count, unit, position, error)
         type(tensor_info), intent(in) :: tensor
         character(*), intent(in) :: dtype
-        integer(int64), intent(in) :: first, count
+        integer(int64), intent(in) :: count
         integer, intent(out) :: unit
         integer(int64), intent(out) :: position
         type(io_error), intent(inout) :: error
-        integer(int64) :: offset, bytes, finish, length, width, tensor_finish
+        integer(int64) :: bytes, finish, length, width, tensor_finish
         integer :: ios
         call require_byte_io(error)
         unit=0
@@ -354,13 +342,9 @@ contains
             return
         end if
         if (.not. same_text(tensor%dtype,dtype)) call fail(error, 'typed payload dtype mismatch: '//tensor%name)
-        if (first < 1 .or. count < 1) call fail(error, 'payload requires positive first/count')
+        if (count < 1) call fail(error, 'payload requires positive count')
         if (error%failed()) return
-        if (first-1 > tensor%elements) then
-            call fail(error, 'payload first exceeds tensor elements')
-            return
-        end if
-        if (count > tensor%elements-(first-1)) then
+        if (count > tensor%elements) then
             call fail(error, 'payload range exceeds tensor elements')
             return
         end if
@@ -369,8 +353,7 @@ contains
         bytes=checked_multiply(tensor%elements,width,error)
         if (bytes /= tensor%nbytes) call fail(error, 'payload descriptor bytecount mismatch')
         tensor_finish=checked_add(tensor%byte_offset,tensor%nbytes,error)
-        offset=checked_multiply(first-1,width,error)
-        position=checked_add(tensor%byte_offset,offset,error)
+        position=tensor%byte_offset
         bytes=checked_multiply(count,width,error)
         finish=checked_add(position,bytes,error)
         position=checked_add(position,1_int64,error)
@@ -389,18 +372,15 @@ contains
         if (error%failed()) close(unit)
     end subroutine
 
-    subroutine read_bf16_flat(tensor, values, error, first)
+    subroutine read_bf16_flat(tensor, values, error)
         type(tensor_info), intent(in) :: tensor
         integer(int16), intent(out) :: values(:)
         type(io_error), intent(out) :: error
-        integer(int64), intent(in), optional :: first
         character(65536) :: buffer
         integer :: unit, ios, n, j, p, high
-        integer(int64) :: start, position, done, count
-        start=1
-        if (present(first)) start=first
+        integer(int64) :: position, done, count
         count=size(values,kind=int64)
-        call payload_unit(tensor,'BF16',start,count,unit,position,error)
+        call payload_unit(tensor,'BF16',count,unit,position,error)
         if (error%failed()) return
         done=0
         do while (done < count)
@@ -423,18 +403,15 @@ contains
         close(unit)
     end subroutine
 
-    subroutine read_u32_flat(tensor, values, error, first)
+    subroutine read_u32_flat(tensor, values, error)
         type(tensor_info), intent(in) :: tensor
         integer(int32), intent(out) :: values(:)
         type(io_error), intent(out) :: error
-        integer(int64), intent(in), optional :: first
         character(65536) :: buffer
         integer :: unit, ios, n, j, p, high
-        integer(int64) :: start, position, done, count
-        start=1
-        if (present(first)) start=first
+        integer(int64) :: position, done, count
         count=size(values,kind=int64)
-        call payload_unit(tensor,'U32',start,count,unit,position,error)
+        call payload_unit(tensor,'U32',count,unit,position,error)
         if (error%failed()) return
         done=0
         do while (done < count)
@@ -482,17 +459,6 @@ contains
     subroutine read_bf16_matrix(tensor, values, error)
         type(tensor_info), intent(in) :: tensor
         integer(int16), contiguous, target, intent(out) :: values(:,:)
-        type(io_error), intent(out) :: error
-        integer(int16), pointer :: flat(:)
-        call require_layout(tensor,shape(values,kind=int64),error)
-        if (error%failed()) return
-        flat(1:size(values,kind=int64)) => values
-        call read_bf16_flat(tensor,flat,error)
-    end subroutine
-
-    subroutine read_bf16_cube(tensor, values, error)
-        type(tensor_info), intent(in) :: tensor
-        integer(int16), contiguous, target, intent(out) :: values(:,:,:)
         type(io_error), intent(out) :: error
         integer(int16), pointer :: flat(:)
         call require_layout(tensor,shape(values,kind=int64),error)

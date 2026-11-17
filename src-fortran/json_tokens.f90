@@ -3,10 +3,11 @@ module json_tokens
     use model_io_support, only: io_error, fail, read_text, max_json_bytes, require_byte_io
     implicit none
     private
-    public :: json_document, json_token, parse_json, read_json, member, element
+    public :: json_document, parse_json, read_json, member, element
     public :: json_integer, json_real, json_string, json_boolean, expect_kind
     public :: same_text
-    integer, parameter, public :: json_object=1, json_array=2, json_text=3, json_number=4, json_bool=5, json_null=6
+    integer, parameter, public :: json_object=1, json_array=2, json_text=3, json_null=6
+    integer, parameter :: json_number=4, json_bool=5
     integer, parameter :: max_tokens=1000000, max_depth=64
 
     type :: json_token

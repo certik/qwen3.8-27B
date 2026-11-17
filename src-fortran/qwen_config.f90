@@ -1,24 +1,19 @@
 module qwen_config
-    use, intrinsic :: iso_fortran_env, only: int32, int64, real32, real64
+    use, intrinsic :: iso_fortran_env, only: int64, real32, real64
     use model_io_support
     use json_tokens
     implicit none
     private
-    public :: dense_config, read_config, read_input_ids
+    public :: dense_config, read_config
 
     type :: dense_config
         integer :: layers=0, hidden=0, intermediate=0, vocab=0, full_interval=0
         integer :: query_heads=0, kv_heads=0, head_dim=0, query_dim=0, kv_dim=0
         integer :: linear_key_heads=0, linear_value_heads=0, linear_key_head_dim=0, linear_value_head_dim=0
         integer :: linear_key_dim=0, linear_value_dim=0, conv_dim=0, conv_kernel=0
-        integer :: max_position=0, rotary_dim=0, quant_bits=0, group_size=0
-        integer :: recurrent_layers=0, attention_layers=0, mtp_layers=0, bos_id=0
-        integer :: pad_id=-1
-        integer(int32), allocatable :: eos_ids(:)
+        integer :: rotary_dim=0, quant_bits=0, group_size=0
         logical, allocatable :: full_attention(:)
         real(real32) :: rms_eps=0, rope_theta=0, rotary_fraction=0
-        logical :: mrope_interleaved=.false.
-        integer :: mrope_section(3)=0
     end type
 
 contains
@@ -28,7 +23,7 @@ contains
         type(dense_config), intent(out) :: config
         type(io_error), intent(out) :: error
         type(json_document) :: doc
-        integer :: tc, rp, q, i, types, eos, item, arch, index, ios
+        integer :: tc, rp, q, i, types, item, arch, index, ios
         integer(int64) :: value, derived
         real(real64) :: fraction, rotary
         character(:), allocatable :: name
@@ -78,11 +73,6 @@ contains
         config%linear_key_head_dim=positive(doc,tc,'linear_key_head_dim',error)
         config%linear_value_head_dim=positive(doc,tc,'linear_value_head_dim',error)
         config%conv_kernel=positive(doc,tc,'linear_conv_kernel_dim',error)
-        config%max_position=positive(doc,tc,'max_position_embeddings',error)
-        value=optional_integer(doc,tc,'mtp_num_hidden_layers',0_int64,error)
-        if (value < 0 .or. value > huge(0)) call fail(error,'config: invalid MTP layer count')
-        if (error%failed()) return
-        config%mtp_layers=int(value)
         config%rms_eps=positive_real(doc,tc,'rms_norm_eps',error)
         rp=member(doc,tc,'rope_parameters')
         call expect_kind(doc,rp,json_object,error)
@@ -99,20 +89,6 @@ contains
         if (item /= 0) then
             rotary=json_real(doc,item,error)
             if (abs(rotary-fraction) > 0) call fail(error,'config: conflicting partial_rotary_factor')
-        end if
-        item=member(doc,rp,'mrope_interleaved')
-        if (item /= 0) config%mrope_interleaved=json_boolean(doc,item,error)
-        item=member(doc,rp,'mrope_section')
-        if (item /= 0) then
-            call expect_kind(doc,item,json_array,error)
-            if (error%failed()) return
-            if (doc%token(item)%count /= 3) call fail(error,'config: mrope_section must have three entries')
-            do i=1,3
-                value=json_integer(doc,element(doc,item,i),error)
-                if (value < 1 .or. value > huge(0)) call fail(error,'config: invalid mrope_section')
-                if (error%failed()) return
-                config%mrope_section(i)=int(value)
-            end do
         end if
         if (error%failed()) return
         config%query_dim=dimension(config%query_heads,config%head_dim,error)
@@ -131,10 +107,6 @@ contains
         if (abs(rotary-real(config%rotary_dim,real64)) > 0) call fail(error,'config: nonintegral rotary dimension')
         if (config%rotary_dim < 2 .or. modulo(config%rotary_dim,2) /= 0) &
             call fail(error,'config: rotary dimension must be positive and even')
-        if (any(config%mrope_section /= 0)) then
-            if (sum(int(config%mrope_section,int64)) /= int(config%rotary_dim/2,int64)) &
-                call fail(error,'config: mrope_section does not cover rotary pairs')
-        end if
         if (modulo(config%query_heads,config%kv_heads) /= 0 .or. &
                 modulo(config%linear_value_heads,config%linear_key_heads) /= 0 .or. config%conv_kernel < 2 .or. &
                 modulo(config%hidden,64) /= 0 .or. modulo(config%intermediate,64) /= 0 .or. &
@@ -162,29 +134,6 @@ contains
             else
                 if (.not. same_text(name,'linear_attention')) call fail(error,'config: layer_types/interval mismatch')
             end if
-        end do
-        config%attention_layers=count(config%full_attention)
-        config%recurrent_layers=config%layers-config%attention_layers
-        config%bos_id=token_id(doc,member(doc,tc,'bos_token_id'),config%vocab,error)
-        item=member(doc,tc,'pad_token_id')
-        if (item /= 0) then
-            if (doc%token(item)%kind /= json_null) config%pad_id=token_id(doc,item,config%vocab,error)
-        end if
-        eos=member(doc,1,'eos_token_id')
-        if (eos == 0) eos=member(doc,tc,'eos_token_id')
-        i=1
-        if (doc%token(eos)%kind == json_array) i=doc%token(eos)%count
-        if (i < 1 .or. i > 16) call fail(error,'config: expected 1..16 EOS IDs')
-        if (error%failed()) return
-        allocate(config%eos_ids(i),stat=ios)
-        if (ios /= 0) then
-            call fail(error,'config: EOS allocation failed')
-            return
-        end if
-        do i=1,size(config%eos_ids)
-            item=eos
-            if (doc%token(eos)%kind == json_array) item=element(doc,eos,i)
-            config%eos_ids(i)=int(token_id(doc,item,config%vocab,error),int32)
         end do
     end subroutine
 
@@ -293,59 +242,4 @@ contains
         if (n > huge(0)) call fail(error,'config: derived dimension exceeds kernel integer range')
         if (.not. error%failed()) value=int(n)
     end function
-
-    integer function token_id(doc, index, vocab, error) result(value)
-        type(json_document), intent(in) :: doc
-        integer, intent(in) :: index, vocab
-        type(io_error), intent(inout) :: error
-        integer(int64) :: n
-        value=0
-        n=json_integer(doc,index,error)
-        if (n < 0 .or. n >= vocab) call fail(error,'config: token ID outside vocabulary')
-        if (.not. error%failed()) value=int(n)
-    end function
-
-    subroutine read_input_ids(path, ids, error, vocab)
-        character(*), intent(in) :: path
-        integer(int32), allocatable, intent(out) :: ids(:)
-        type(io_error), intent(out) :: error
-        integer(int64), intent(in), optional :: vocab
-        type(json_document) :: doc
-        integer :: array, index, i, ios
-        integer(int64) :: n, limit
-        limit=int(huge(0_int32),int64)+1
-        if (present(vocab)) then
-            if (vocab < 1 .or. vocab > limit) then
-                call fail(error,'input IDs: vocabulary must be in 1..2^31')
-                return
-            end if
-            limit=vocab
-        end if
-        call read_json(path,doc,error)
-        if (error%failed()) return
-        array=1
-        if (doc%token(1)%kind == json_object) array=member(doc,1,'input_ids')
-        call expect_kind(doc,array,json_array,error)
-        if (error%failed()) return
-        if (doc%token(array)%count < 1) then
-            call fail(error,'input IDs: array must not be empty')
-            return
-        end if
-        allocate(ids(doc%token(array)%count),stat=ios)
-        if (ios /= 0) then
-            call fail(error,'input IDs: allocation failed')
-            return
-        end if
-        index=doc%token(array)%first
-        do i=1,size(ids)
-            n=json_integer(doc,index,error)
-            if (error%failed()) return
-            if (n < 0 .or. n >= limit) then
-                call fail(error,'input IDs: integer outside vocabulary/int32 range')
-                return
-            end if
-            ids(i)=int(n,int32)
-            index=doc%token(index)%next
-        end do
-    end subroutine
 end module

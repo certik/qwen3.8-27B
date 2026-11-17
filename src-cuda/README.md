@@ -70,7 +70,7 @@ On mercury, use GPU 0: `CUDA_VISIBLE_DEVICES=0 ./qwen …`. Weight upload takes 
 
 Every linear layer stays in MLX's affine 8-bit format: the `U32 [N, K/4]` weight tensor is used as `N×K` bytes,
 next to `[N, K/64]` bf16 scales and biases, so `W[n,k] = q·scale + bias` per group of 64. This is exactly
-what `linear_q8_bf16` in `src-fortran/dense_kernels.f90` reads.
+what `qmat` in `src-fortran/kernels.f90` holds.
 
 Matrices that multiply the same input are stacked along N at load time (concatenating the byte arrays), so
 one GEMV computes all of them. The gate and up rows are interleaved in pairs (`g0 g1 u0 u1 g2 g3 …`), so the

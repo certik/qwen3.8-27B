@@ -6,7 +6,7 @@ in three implementations that read the same safetensors files:
 | Directory | What |
 |---|---|
 | [`src-cpu`](src-cpu) | Single-threaded C99 reference: the numerical specification |
-| `src-fortran` | Fortran implementation (CPU, and GPU through LFortran) |
+| `src-fortran` | Fortran implementation of `src-cuda`, run on the GPU through LFortran, about 106 tok/s decode on one H200 |
 | `src-cuda` | C + CUDA implementation, about 120 tok/s decode on one H200 |
 
 ## Download the weights
@@ -22,7 +22,7 @@ $ hf download lmstudio-community/Qwen3.8-27B-MLX-8bit --local-dir "$MODEL_DIR"
 ```
 
 (`huggingface-cli download` with the same arguments works with older `huggingface_hub`.) All three
-implementations read this directory directly (`--model "$MODEL_DIR"`); it must contain
+implementations read this directory directly (`--model "$MODEL_DIR"`, or `-m` for the CUDA and Fortran programs); it must contain
 `model-0000*-of-00006.safetensors`, `model.safetensors.index.json`, `config.json`, `tokenizer.json`
 and `vocab.json`. Use a local disk: loading takes about 6 s from cache.
 
@@ -38,32 +38,39 @@ See [`src-cpu/README.md`](src-cpu/README.md).
 ## Fortran implementation
 
 Plain Fortran (`do concurrent`, no C, no vendor libraries) that LFortran compiles
-for NVIDIA GPUs with `--gpu=cuda` or Apple GPUs with `--gpu=metal`:
+for NVIDIA GPUs with `--gpu=cuda` or Apple GPUs with `--gpu=metal`. It mirrors the CUDA
+implementation: [`kernels.f90`](src-fortran/kernels.f90) has the kernels of
+[`src-cuda/kernels.cu`](src-cuda/kernels.cu) as `do concurrent` loops (one loop per CUDA kernel, three
+each for the Gated DeltaNet and the attention), and [`qwen.f90`](src-fortran/qwen.f90) is the program
+of `src-cuda/main.c`. The safetensors, config and JSON readers are in `safetensors_io.f90`,
+`qwen_config.f90`, `json_tokens.f90` and `model_io_support.f90`.
 
 ```console
 $ LFORTRAN_LINKER=gcc make fortran-gpu      # needs a recent LFortran main
-$ ./qwen-fortran-cuda --model "$MODEL_DIR" --no-think \
-    --prompt "What is the capital of France? Answer in one sentence."
+$ ./qwen-fortran-cuda -m "$MODEL_DIR" --no-think \
+    -p "What is the capital of France? Answer in one sentence."
+What is the capital of France? Answer in one sentence.
+
 The capital of France is Paris.
 ```
 
 The tokenizer (byte-level BPE, the Qwen pre-tokenizer, NFC normalization and the chat template) is
 written in Fortran too ([`qwen_tokenizer.f90`](src-fortran/qwen_tokenizer.f90)), checked against
-HuggingFace `tokenizers` with `make fortran-tokenizer-test`. `--prompt` applies the chat template and
-streams the answer as text; `--raw` tokenizes the prompt as is, `--system TEXT` adds a system message,
-`--think` (default) / `--no-think` selects thinking mode, `--prompt-file` reads the prompt from a file,
-`--tokenize TEXT` / `--detokenize ids.json` run the tokenizer alone (no weights), and
-`--max-tokens N` (default 256) bounds the answer. For benchmarking, `--input-ids ids.json --fixed-steps
---result out.json` runs on token ids and writes a JSON report.
+HuggingFace `tokenizers` with `make fortran-tokenizer-test`. `-p PROMPT` applies the chat template (one
+user message) and streams the answer as text; `--raw` tokenizes the prompt as is, `--no-think` turns
+thinking off (it is on by default), `-n N` (default 512) bounds the answer, `-c N` sets the context
+capacity (default 8192), `-m DIR` is the model directory and `--ids` prints the prompt and output token
+ids to stderr. Generation is greedy.
 
-### NVIDIA GPU demo
+### NVIDIA GPU
 
-Built with LFortran `main` at `6855c1f679`, run on one H200 NVL (answers are generated on the GPU;
-`timing:` lines go to stderr):
+Built with LFortran `main` at `5d4680d679`, run on one H200 NVL (the timing lines go to stderr):
 
 ````console
-$ ./qwen-fortran-cuda --model "$MODEL_DIR" --no-think \
-    --prompt "Write a Fortran function that returns the n-th Fibonacci number."
+$ ./qwen-fortran-cuda -m "$MODEL_DIR" --no-think -n 128 \
+    -p "Write a Fortran function that returns the n-th Fibonacci number."
+Write a Fortran function that returns the n-th Fibonacci number.
+
 ```fortran
 function fib(n) result(f)
     implicit none
@@ -86,13 +93,14 @@ function fib(n) result(f)
     end if
 end function fib
 ```
-timing: load    5.865 s, prefill    2.321 s, first decode step    0.011 s
-timing: steady decode 126 tokens     1.240 s =   101.62 tok/s, median step     9.81 ms, max    10.89 ms
+tokenizer .1 s, weights + state in 6.2 s, prompt 25 tokens
+prefill: 25 tokens in .878 s (28.5 tok/s); decode: 126 tokens in 1.187 s (106.1 tok/s)
 ````
 
-Decode speed on one H200 NVL: **about 102 tok/s** (9.8 ms per token; 5 runs: 101.99 to 102.36 tok/s).
-For comparison the CUDA implementation reaches about 120 tok/s. Prefill is not optimized yet
-(about 2.3 s for a 24-token prompt).
+Decode speed on one H200 NVL: **about 106 tok/s** (3 runs: 106.1 tok/s each); for comparison the CUDA
+implementation reaches about 120 tok/s. The greedy token ids are identical to those of `src-cuda`.
+The prompt goes through the same single-token forward pass, one token at a time (prefill is not
+optimized).
 See [`src-fortran/README.md`](src-fortran/README.md).
 
 ### Apple GPU (Metal)
@@ -102,23 +110,20 @@ Set `MODEL_DIR` to the downloaded MLX 8-bit checkpoint directory (see above), th
 build from the repository root:
 
 ```console
-$ lfortran --fast --gpu=metal --gpu-overlap \
-    src-fortran/precision_formats.f90 src-fortran/dense_kernels.f90 \
+$ lfortran --fast --realloc-lhs-arrays --gpu=metal --gpu-overlap \
     src-fortran/model_io_support.f90 src-fortran/json_tokens.f90 \
     src-fortran/safetensors_io.f90 src-fortran/qwen_config.f90 \
-    src-fortran/qwen_weights.f90 src-fortran/inference_dump.f90 \
-    src-fortran/dense_model.f90 src-fortran/qwen_tokenizer.f90 \
-    src-fortran/main.f90 -o qwen-fortran-metal
-$ ./qwen-fortran-metal --model "$MODEL_DIR" --no-think \
-    --prompt "Write a Fortran function that returns the n-th Fibonacci number."
+    src-fortran/qwen_tokenizer.f90 src-fortran/kernels.f90 \
+    src-fortran/qwen.f90 -o qwen-fortran-metal
+$ ./qwen-fortran-metal -m "$MODEL_DIR" --no-think \
+    -p "Write a Fortran function that returns the n-th Fibonacci number."
 ```
-
-This runs inference on the Apple GPU and produces the same Fibonacci function as
-the H200 demo above.
 
 The recorded Apple M4 Max (64 GiB unified memory) steady-decode baseline is
 **3.42 tok/s**, measured over 63 timed tokens in a 64-token fixed-step run;
-model loading and prefill are excluded. This is the initial, unoptimized baseline.
+model loading and prefill are excluded. It was measured with the previous Fortran
+implementation (which produced the same Fibonacci function on the Apple GPU as on
+the H200) and has not been re-measured with the current one.
 The tested source revisions were:
 
 - Qwen Fortran `main`: `4ac8c553536a4cdb444d9c757592376220ff7dba`.
