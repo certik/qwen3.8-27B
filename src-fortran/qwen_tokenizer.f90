@@ -1319,9 +1319,9 @@ module qwen_tokenizer
     use qwen_unicode_data
     implicit none
     private
-    public :: bpe_tokenizer, text_stream, load_tokenizer, encode_text, decode_ids
-    public :: stream_reset, stream_feed, stream_flush, chat_prompt, json_escape
-    public :: read_file_bytes, token_text, is_stop_token, sanitize_utf8, nfc_utf8
+    public :: bpe_tokenizer, text_stream, load_tokenizer, encode_text, is_stop_token
+    public :: stream_reset, stream_feed, chat_prompt
+    public :: read_file_bytes, decode_ids, nfc_utf8   ! for tests/test_tokenizer.f90
 
     integer, parameter :: max_piece_bytes = 4096
 
@@ -1332,7 +1332,6 @@ module qwen_tokenizer
         integer(int32), allocatable :: off(:)        ! 0:n_tokens, bytes of id are pool(off(id)+1:off(id+1))
         integer(int32), allocatable :: vtab(:)       ! 0:vmask, id+1 or 0
         integer :: vmask = 0
-        integer :: n_merges = 0
         integer(int32), allocatable :: ma(:), mb(:), mr(:)
         integer(int32), allocatable :: mtab(:)       ! 0:mmask, merge index or 0
         integer :: mmask = 0
@@ -1344,7 +1343,7 @@ module qwen_tokenizer
         logical, allocatable :: special(:)           ! 0:n_tokens-1
         logical :: first_added(0:255) = .false.
         integer(int32), allocatable :: eos(:)
-        integer(int32) :: im_start = -1, im_end = -1, endoftext = -1
+        integer(int32) :: im_end = -1, endoftext = -1
         ! scratch for BPE
         integer(int32), allocatable :: w_sym(:), w_prv(:), w_nxt(:), h_l(:), h_r(:)
         integer(int64), allocatable :: h_key(:)
@@ -1987,12 +1986,6 @@ contains
                 end if
                 call skip_ws(buf, pos)
                 pos = pos + 1   ! ']'
-            else if (buf(pos:pos) == '"') then
-                call json_token_pair(tok, buf, pos, ta, n, tb, nb, ok)
-                if (.not. ok) then
-                    err = 'tokenizer.json: bad merge string'
-                    return
-                end if
             else
                 err = 'tokenizer.json: unexpected merge entry'
                 return
@@ -2017,7 +2010,6 @@ contains
             end do
             tok%mtab(h) = nm
         end do
-        tok%n_merges = nm
         deallocate(buf)
 
         ! ---- added tokens: sort longest first, remember first bytes
@@ -2042,8 +2034,6 @@ contains
                 tok%first_added(iachar(tok%pool(tok%off(id)+1:tok%off(id)+1))) = .true.
             end if
             select case (token_text(tok, id))
-            case ('<|im_start|>')
-                tok%im_start = id
             case ('<|im_end|>')
                 tok%im_end = id
             case ('<|endoftext|>')
@@ -2100,51 +2090,6 @@ contains
         deallocate(tok%eos)
         allocate(tok%eos(cnt))
         tok%eos = tmp(1:cnt)
-    end subroutine
-
-    ! "a b" merge strings (older tokenizer.json files)
-    subroutine json_token_pair(tok, buf, pos, ta, na, tb, nb, ok)
-        type(bpe_tokenizer), intent(in) :: tok
-        character(*), intent(in) :: buf
-        integer, intent(inout) :: pos
-        character(*), intent(inout) :: ta, tb
-        integer, intent(out) :: na, nb
-        logical, intent(out) :: ok
-        integer :: p, q
-        ok = .false.
-        na = 0
-        nb = 0
-        q = pos + 1
-        p = q
-        do while (p <= len(buf))
-            if (buf(p:p) == ' ' .or. buf(p:p) == '"') exit
-            p = p + 1
-        end do
-        if (p > len(buf)) return
-        if (buf(p:p) /= ' ') return
-        ! reuse json_token on a temporary quoted copy of each half
-        block
-            character(:), allocatable :: s
-            integer :: pp
-            s = '"'//buf(q:p-1)//'"'
-            pp = 1
-            call json_token(tok, s, pp, ta, na, ok)
-            if (.not. ok) return
-            q = p + 1
-            p = q
-            do while (p <= len(buf))
-                if (buf(p:p) == '"') exit
-                p = p + 1
-            end do
-            if (p > len(buf)) then
-                ok = .false.
-                return
-            end if
-            s = '"'//buf(q:p-1)//'"'
-            pp = 1
-            call json_token(tok, s, pp, tb, nb, ok)
-            pos = p + 1
-        end block
     end subroutine
 
     subroutine grow_chars(s)
@@ -2309,16 +2254,6 @@ contains
             call put_utf8(t, k, int(c(i)))
         end do
         s = t(1:k)
-    end function
-
-    ! Replace invalid UTF-8 by U+FFFD (what the tokenizer sees).
-    function sanitize_utf8(s) result(r)
-        character(*), intent(in) :: s
-        character(:), allocatable :: r
-        integer(int32), allocatable :: c(:)
-        integer :: n
-        call utf8_to_cps(s, c, n)
-        r = cps_to_utf8(c, n)
     end function
 
     ! ------------------------------------------------------------------
@@ -3026,47 +2961,5 @@ contains
         else
             s = s//'<think>'//nl//nl//'</think>'//nl//nl
         end if
-    end function
-
-    ! ------------------------------------------------------------------
-    ! JSON string body (without quotes); invalid UTF-8 becomes U+FFFD
-    ! ------------------------------------------------------------------
-
-    function json_escape(s) result(r)
-        character(*), intent(in) :: s
-        character(:), allocatable :: r
-        character(:), allocatable :: t, w
-        character(16) :: hex
-        integer :: i, k, b
-        w = sanitize_utf8(s)
-        allocate(character(6 * len(w) + 8) :: t)
-        k = 0
-        do i = 1, len(w)
-            b = iachar(w(i:i))
-            if (b == 34 .or. b == 92) then
-                t(k+1:k+2) = '\'//w(i:i)
-                k = k + 2
-            else if (b < 32) then
-                select case (b)
-                case (10)
-                    t(k+1:k+2) = '\n'
-                    k = k + 2
-                case (13)
-                    t(k+1:k+2) = '\r'
-                    k = k + 2
-                case (9)
-                    t(k+1:k+2) = '\t'
-                    k = k + 2
-                case default
-                    write(hex, '(z4.4)') b
-                    t(k+1:k+6) = '\u'//hex(1:4)
-                    k = k + 6
-                end select
-            else
-                k = k + 1
-                t(k:k) = w(i:i)
-            end if
-        end do
-        r = t(1:k)
     end function
 end module qwen_tokenizer
