@@ -13,7 +13,7 @@ module model
     use kernels
     implicit none
     private
-    public :: weights, state, load_model, alloc_state, forward
+    public :: weights, state, load_model, alloc_state, step
 
     type :: layer
         logical :: linear
@@ -31,9 +31,7 @@ module model
     ! between the host and the GPU with the small arrays next to them.
     integer, parameter :: max_layers = 64
 
-    ! The parts of the argmax. Their results, which the host reads at every token, are smaller than
-    ! 4 KB: such arrays are copied back at the wait, while the pages of a managed array would move to
-    ! the host and back to the GPU, at a page fault each.
+    ! The parts of the argmax, which argmax_final combines on the GPU into the next token.
     integer, parameter :: np = 512
 
     type :: weights
@@ -45,16 +43,17 @@ module model
 
     type :: layer_state
         real, allocatable :: conv(:,:), ssm(:,:,:)   ! linear attention: conv inputs, recurrent state
-        real, allocatable :: kc(:,:,:), vc(:,:,:)    ! full attention: KV cache, kc(d, kh, t), vc(t, d, kh)
+        real, allocatable :: kc(:,:,:), vc(:,:,:)    ! full attention: KV cache, kc(d, kh, t), vc(d, kh, t)
     end type
 
     type :: state
-        real, allocatable :: x(:), xw(:), ssp(:)     ! residual stream, x * next norm weight, sum x**2 parts
+        real, allocatable :: x(:), xw(:)     ! residual stream, x * next norm weight
+        integer(int64), allocatable :: ss(:) ! sum x**2 in fixed point (scale 2**24), in slot k of two (padded)
+        integer :: k = 1
         real, allocatable :: y(:), o(:), mid(:), logits(:)
-        real, allocatable :: qkv(:), go(:,:)         ! Gated DeltaNet
-        real, allocatable :: qr(:,:), sc(:,:), rc(:,:), rs(:,:)   ! attention: q heads, scores, RoPE cos/sin
+        real, allocatable :: pm(:,:,:), pl(:,:,:), pa(:,:,:,:), rc(:,:), rs(:,:)   ! attention: chunks, RoPE cos/sin
         real, allocatable :: pv(:)                   ! argmax parts (see np)
-        integer, allocatable :: pi(:)
+        integer, allocatable :: pi(:), tokbuf(:), hist(:)
         type(layer_state) :: l(max_layers)
     end type
 
@@ -203,14 +202,16 @@ contains
         type(state), intent(out) :: s
         integer, intent(in) :: max_ctx
         integer :: l, j, t
+        if (max_ctx > AMAX) error stop 'the context is at most AMAX positions (kernels.f90)'
         associate (c => w%c)
-            allocate(s%x(c%hidden), s%xw(c%hidden), s%ssp(c%hidden/4), s%mid(c%intermediate), s%logits(c%vocab), &
+            allocate(s%x(c%hidden), s%xw(c%hidden), s%ss(pad(2)), s%mid(c%intermediate), s%logits(c%vocab), &
                 s%y(max(2*c%intermediate, c%conv_dim + c%linear_value_dim + 2*c%linear_value_heads, &
                         2*c%query_dim + 2*c%kv_dim)), &
-                s%o(max(c%linear_value_dim, c%query_dim)), s%qkv(c%conv_dim), &
-                s%go(c%linear_value_head_dim, c%linear_value_heads), &
-                s%qr(c%head_dim, c%query_heads), s%sc(max_ctx, c%query_heads), s%rc(c%rotary_dim/2, max_ctx), s%rs(c%rotary_dim/2, max_ctx), &
-                s%pv(np), s%pi(np))
+                s%o(max(c%linear_value_dim, c%query_dim)), &
+                s%pm(AG, c%kv_heads, max_ctx/AC + 1), s%pl(AG, c%kv_heads, max_ctx/AC + 1), &
+                s%pa(c%head_dim, AG, c%kv_heads, max_ctx/AC + 1), s%rc(c%rotary_dim/2, max_ctx), s%rs(c%rotary_dim/2, max_ctx), &
+                s%pv(pad(np)), s%pi(pad(np)), s%tokbuf(pad(1)), s%hist(max(max_ctx, 1024)))
+            s%ss = 0
             do t = 1, max_ctx   ! RoPE angles of the positions t - 1
                 do j = 1, c%rotary_dim/2
                     s%rc(j,t) = real(cos(mod((t-1) * real(c%rope_theta, real64)**(-2.0_real64*(j-1)/c%rotary_dim), &
@@ -221,75 +222,73 @@ contains
             end do
             do l = 1, c%layers
                 if (w%l(l)%linear) then
-                    allocate(s%l(l)%conv(c%conv_dim, c%conv_kernel-1), s%l(l)%ssm(c%linear_key_head_dim, &
+                    allocate(s%l(l)%conv(c%conv_dim, 2*(c%conv_kernel-1)), s%l(l)%ssm(c%linear_key_head_dim, &
                         c%linear_value_head_dim, c%linear_value_heads))
                     s%l(l)%conv = 0
                     s%l(l)%ssm = 0
                 else
-                    allocate(s%l(l)%kc(c%head_dim, c%kv_heads, max_ctx), s%l(l)%vc(max_ctx, c%head_dim, c%kv_heads))
+                    allocate(s%l(l)%kc(c%head_dim, c%kv_heads, max_ctx), s%l(l)%vc(c%head_dim, c%kv_heads, max_ctx))
                 end if
             end do
         end associate
     end subroutine
 
-    ! One token's forward pass: token `tok` at position `pos` (from 0) -> the next token (greedy).
-    ! 5 GEMVs-and-friends per layer: RMSNorm, residual adds and SwiGLU are fused into the GEMVs.
-    integer function forward(w, s, tok, pos) result(next)
+    ! One token's forward pass at position `pos` (from 0): the token in s%tokbuf(1) -> the next one (greedy),
+    ! into s%tokbuf(1) and s%hist(pos+1), on the GPU. 5 GEMVs-and-friends per layer: RMSNorm, residual adds
+    ! and SwiGLU are fused into the GEMVs.
+    subroutine step(w, s, pos)
         type(weights), intent(in) :: w
         type(state), intent(inout) :: s
-        integer, intent(in) :: tok, pos
-        integer :: l, j
-        real :: best
+        integer, intent(in) :: pos
+        integer :: l
         associate (c => w%c)
-            call embed(w%embed%w, w%embed%s, w%embed%b, tok, w%l(1)%in_norm, s%x, s%xw, s%ssp)
+            s%k = 3 - s%k
+            call embed(w%embed%w, w%embed%s, w%embed%b, s%tokbuf, w%l(1)%in_norm, s%x, s%xw, s%ss, s%k)
             do l = 1, c%layers
                 associate (y => w%l(l), t => s%l(l))
-                    call k_gemv_norm(y%in_proj, s%xw, s%ssp, c%rms_eps, .false., s%y)   ! y = W_in rmsnorm(x)
+                    call k_gemv_norm(y%in_proj, s%xw, s%ss, s%k, c%rms_eps, .false., s%y)   ! y = W_in rmsnorm(x)
                     if (y%linear) then   ! Gated DeltaNet
-                        call gdn_conv(s%y, y%conv_w, t%conv, s%qkv)
-                        call gdn_step(s%qkv, s%y, y%a_log, y%dt_bias, c%linear_key_heads, t%ssm, s%go)
-                        call gdn_norm(s%go, s%y, c%conv_dim, y%norm_w, c%rms_eps, s%o)
+                        call gdn(s%y, y%conv_w, y%a_log, y%dt_bias, y%norm_w, c%linear_key_heads, pos, c%rms_eps, &
+                            t%conv, t%ssm, s%o)
                     else                 ! full attention
-                        call attn_qkv(s%y, y%q_norm, y%k_norm, s%rc, s%rs, c%rms_eps, pos, s%qr, t%kc, t%vc)
-                        call attn_scores(s%qr, t%kc, pos + 1, s%sc)
-                        call attn_out(s%y, s%sc, t%vc, pos + 1, s%o)
+                        call attn_part(s%y, y%q_norm, y%k_norm, s%rc, s%rs, c%rms_eps, pos, t%kc, t%vc, &
+                            s%pm, s%pl, s%pa)
+                        call attn_combine(s%y, s%pm, s%pl, s%pa, pos, s%o)
                     end if
-                    call k_gemv_resid(y%out_proj, s%o, y%post_norm, s%x, s%xw, s%ssp)                ! x += W_out o
-                    call k_gemv_norm(y%gate_up, s%xw, s%ssp, c%rms_eps, .true., s%mid)          ! mid = silu(gate) * up
+                    s%k = 3 - s%k
+                    call k_gemv_resid(y%out_proj, s%o, y%post_norm, s%x, s%xw, s%ss, s%k)                ! x += W_out o
+                    call k_gemv_norm(y%gate_up, s%xw, s%ss, s%k, c%rms_eps, .true., s%mid)          ! mid = silu(gate) * up
+                    s%k = 3 - s%k
                     if (l < c%layers) then
-                        call k_gemv_resid(y%down, s%mid, w%l(l+1)%in_norm, s%x, s%xw, s%ssp)         ! x += W_down mid
+                        call k_gemv_resid(y%down, s%mid, w%l(l+1)%in_norm, s%x, s%xw, s%ss, s%k)         ! x += W_down mid
                     else
-                        call k_gemv_resid(y%down, s%mid, w%final_norm, s%x, s%xw, s%ssp)
+                        call k_gemv_resid(y%down, s%mid, w%final_norm, s%x, s%xw, s%ss, s%k)
                     end if
                 end associate
             end do
-            call k_gemv_norm(w%lm_head, s%xw, s%ssp, c%rms_eps, .false., s%logits)
+            call k_gemv_norm(w%lm_head, s%xw, s%ss, s%k, c%rms_eps, .false., s%logits)
             call argmax_part(s%logits, np, s%pv, s%pi)
-            best = s%pv(1)   ! the largest logit, at its first index
-            next = s%pi(1)
-            do j = 2, np
-                if (s%pv(j) > best .or. (s%pv(j) == best .and. s%pi(j) < next)) then
-                    best = s%pv(j)
-                    next = s%pi(j)
-                end if
-            end do
-            next = next - 1
+            call argmax_final(s%pv, s%pi, np, pos, s%tokbuf, s%hist)
         end associate
-    end function
-
-    subroutine k_gemv_norm(m, xw, ssp, eps, swiglu, y)
-        type(qmat), intent(in) :: m
-        real, intent(in) :: xw(:), ssp(:), eps
-        logical, intent(in) :: swiglu
-        real, intent(inout) :: y(:)
-        call gemv_norm(m%w, m%s, m%b, xw, ssp, eps, swiglu, y)
     end subroutine
 
-    subroutine k_gemv_resid(m, v, wnext, x, xw, ssp)
+    subroutine k_gemv_norm(m, xw, ss, k, eps, swiglu, y)
+        type(qmat), intent(in) :: m
+        real, intent(in) :: xw(:), eps
+        integer(int64), intent(inout) :: ss(:)
+        integer, intent(in) :: k
+        logical, intent(in) :: swiglu
+        real, intent(inout) :: y(:)
+        call gemv_norm(m%w, m%s, m%b, xw, ss, k, eps, swiglu, y)
+    end subroutine
+
+    subroutine k_gemv_resid(m, v, wnext, x, xw, ss, k)
         type(qmat), intent(in) :: m
         real, intent(in) :: v(:), wnext(:)
-        real, intent(inout) :: x(:), xw(:), ssp(:)
-        call gemv_resid(m%w, m%s, m%b, v, wnext, x, xw, ssp)
+        real, intent(inout) :: x(:), xw(:)
+        integer(int64), intent(inout) :: ss(:)
+        integer, intent(in) :: k
+        call gemv_resid(m%w, m%s, m%b, v, wnext, x, xw, ss, k)
     end subroutine
 
 end module model
@@ -305,7 +304,8 @@ program qwen
     type(text_stream) :: stream
     character(:), allocatable :: dir, prompt, text, arg, err, buf
     integer(int32), allocatable :: ids(:), out(:)
-    integer :: i, max_new, max_ctx, n_out, next, nb
+    integer :: i, max_new, max_ctx, n_out, queued, nb
+    integer, parameter :: ahead = 16   ! decode steps queued ahead of the tokens printed
     logical :: think, raw, show_ids
     integer(int64) :: t0, t1, t2, t3, t4, rate
 
@@ -355,10 +355,10 @@ program qwen
 
     ! Prefill: the prompt goes through the same single-token forward pass, one token at a time.
     do i = 1, size(ids)
-        next = forward(w, s, ids(i), i - 1)
+        s%tokbuf(1) = ids(i)
+        call step(w, s, i - 1)
     end do
     call system_clock(t3)
-    t4 = t3
 
     ! Decode
     allocate(out(max_new))
@@ -367,20 +367,30 @@ program qwen
     if (.not. raw) write(output_unit, '(a)', advance='no') prompt//achar(10)//achar(10)
     if (.not. raw .and. think) write(output_unit, '(a)', advance='no') '<think>'//achar(10)
     flush(output_unit)
-    n_out = 0
+    ! The steps run `ahead` tokens ahead of the host, which reads and prints the tokens behind them: the GPU
+    ! never waits for the host. Step q (at position size(ids) + q - 1) takes token out(q) and gives out(q+1).
+    call system_clock(t4)
+    out(1) = s%hist(size(ids))
+    n_out = 1
+    queued = 0
     do
-        n_out = n_out + 1
-        out(n_out) = next
-        if (is_stop_token(tok, next)) exit
-        call stream_feed(tok, stream, next, buf, nb)
+        if (is_stop_token(tok, out(n_out))) exit
+        call stream_feed(tok, stream, out(n_out), buf, nb)
         if (nb > 0) write(output_unit, '(a)', advance='no') buf(1:nb)
         flush(output_unit)
         if (n_out >= max_new) exit
-        if (n_out == 1) call system_clock(t4)
-        next = forward(w, s, next, size(ids) + n_out - 1)
+        if (queued < n_out) then
+            do while (queued < min(n_out + ahead - 1, max_new - 1))
+                queued = queued + 1
+                call step(w, s, size(ids) + queued - 1)
+            end do
+        end if
+        n_out = n_out + 1
+        out(n_out) = s%hist(size(ids) + n_out - 1)
     end do
     call system_clock(t1)
     write(output_unit, '()')
+    flush(output_unit)
     if (show_ids) write(error_unit, '(a,i0,a,*(1x,i0))') 'output ids (', n_out, '):', out(:n_out)
     write(error_unit, '(a,i0,a,f0.3,a,f0.1,a,i0,a,f0.3,a,f0.1,a)') 'prefill: ', size(ids), ' tokens in ', &
         real(t3-t2)/rate, ' s (', size(ids)/(real(t3-t2)/rate), ' tok/s); decode: ', n_out - 1, ' tokens in ', &
