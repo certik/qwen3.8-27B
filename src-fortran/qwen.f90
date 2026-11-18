@@ -221,7 +221,7 @@ contains
             end do
             do l = 1, c%layers
                 if (w%l(l)%linear) then
-                    allocate(s%l(l)%conv(c%conv_dim, c%conv_kernel-1), s%l(l)%ssm(c%linear_key_head_dim, &
+                    allocate(s%l(l)%conv(c%conv_dim, 2*(c%conv_kernel-1)), s%l(l)%ssm(c%linear_key_head_dim, &
                         c%linear_value_head_dim, c%linear_value_heads))
                     s%l(l)%conv = 0
                     s%l(l)%ssm = 0
@@ -246,9 +246,8 @@ contains
                 associate (y => w%l(l), t => s%l(l))
                     call k_gemv_norm(y%in_proj, s%xw, s%ssp, c%rms_eps, .false., s%y)   ! y = W_in rmsnorm(x)
                     if (y%linear) then   ! Gated DeltaNet
-                        call gdn_conv(s%y, y%conv_w, t%conv, s%qkv)
-                        call gdn_step(s%qkv, s%y, y%a_log, y%dt_bias, c%linear_key_heads, t%ssm, s%go)
-                        call gdn_norm(s%go, s%y, c%conv_dim, y%norm_w, c%rms_eps, s%o)
+                        call gdn(s%y, y%conv_w, y%a_log, y%dt_bias, y%norm_w, c%linear_key_heads, pos, c%rms_eps, &
+                            t%conv, t%ssm, s%o)
                     else                 ! full attention
                         call attn_qkv(s%y, y%q_norm, y%k_norm, s%rc, s%rs, c%rms_eps, pos, s%qr, t%kc, t%vc)
                         call attn_scores(s%qr, t%kc, pos + 1, s%sc)

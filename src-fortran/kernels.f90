@@ -17,7 +17,7 @@ module kernels
     use, intrinsic :: iso_fortran_env, only: int16, int32
     implicit none
     private
-    public :: qmat, bf, embed, gemv_norm, gemv_resid, gdn_conv, gdn_step, gdn_norm
+    public :: qmat, bf, embed, gemv_norm, gemv_resid, gdn_conv, gdn_step, gdn_norm, gdn
     public :: attn_qkv, attn_scores, attn_out, argmax_part
 
     ! One MLX affine 8-bit matrix (group size 64) in the checkpoint's own layout: w(:, n) holds the K
@@ -247,6 +247,78 @@ contains
                 do v = 1, GD
                     z = y(z0 + (h-1)*GD + v)
                     out((h-1)*GD + v) = o(v,h) * r * nw(v) * z * sigmoid(z)
+                end do
+            end block
+        end do
+    end subroutine
+
+    ! One value head per iteration: the conv of its q, k, v channels, the Gated DeltaNet step and the gated
+    ! RMSNorm. st(v, j, h): the state, v fastest. cs(c, 1:6): conv inputs, double buffered by position parity.
+    subroutine gdn(y, cw, a_log, dt_bias, nw, nk, p, eps, cs, st, out)
+        real, intent(in) :: y(:), cw(:,:), a_log(:), dt_bias(:), nw(:), eps
+        integer, intent(in) :: nk, p
+        real, intent(inout) :: cs(:,:), st(:,:,:), out(:)
+        integer :: nv, c, h
+        nv = size(st, 3)
+        c = size(cw, 2)
+        do concurrent (h = 1:nv)
+            block
+                real :: q(GD), k(GD), v(GD), o(GD)
+                real :: kk, qq, kn, qn, sp, g, beta, ss, r, sk, sq, delta, z
+                integer :: j, i, kq0, kk0, vc0, pi, po
+                kq0 = ((h-1) / (nv/nk)) * GD
+                kk0 = nk*GD + kq0
+                vc0 = 2*nk*GD + (h-1)*GD
+                pi = 3*mod(p, 2)
+                po = 3 - pi
+                do concurrent (j = 1:GD)
+                    q(j) = cw(1,kq0+j)*cs(kq0+j,pi+1) + cw(2,kq0+j)*cs(kq0+j,pi+2) + cw(3,kq0+j)*cs(kq0+j,pi+3) + cw(4,kq0+j)*y(kq0+j)
+                    q(j) = q(j) * sigmoid(q(j))
+                    k(j) = cw(1,kk0+j)*cs(kk0+j,pi+1) + cw(2,kk0+j)*cs(kk0+j,pi+2) + cw(3,kk0+j)*cs(kk0+j,pi+3) + cw(4,kk0+j)*y(kk0+j)
+                    k(j) = k(j) * sigmoid(k(j))
+                    v(j) = cw(1,vc0+j)*cs(vc0+j,pi+1) + cw(2,vc0+j)*cs(vc0+j,pi+2) + cw(3,vc0+j)*cs(vc0+j,pi+3) + cw(4,vc0+j)*y(vc0+j)
+                    v(j) = v(j) * sigmoid(v(j))
+                end do
+                kk = 0; qq = 0
+                do j = 1, GD
+                    kk = kk + k(j) * k(j)
+                    qq = qq + q(j) * q(j)
+                end do
+                kn = 1 / sqrt(kk + 1e-6)
+                qn = 1 / sqrt(qq + 1e-6) / sqrt(real(GD))
+                sp = y(c + nv*GD + nv + h) + dt_bias(h)
+                if (sp <= 20) sp = log(1 + exp(sp))
+                g = exp(-exp(a_log(h)) * sp)
+                beta = sigmoid(y(c + nv*GD + h))
+                do concurrent (i = 1:GD)
+                    sk = 0; sq = 0
+                    do j = 1, GD
+                        sk = sk + st(i,j,h) * k(j)
+                    end do
+                    delta = (v(i) - g * sk * kn) * beta
+                    do j = 1, GD
+                        st(i,j,h) = g * st(i,j,h) + k(j) * kn * delta
+                        sq = sq + st(i,j,h) * q(j)
+                    end do
+                    o(i) = sq * qn
+                end do
+                ss = 0
+                do j = 1, GD
+                    ss = ss + o(j) * o(j)
+                end do
+                r = 1 / sqrt(ss / GD + eps)
+                do concurrent (i = 1:GD)
+                    z = y(c + (h-1)*GD + i)
+                    out((h-1)*GD + i) = o(i) * r * nw(i) * z * sigmoid(z)
+                end do
+                if (mod(h-1, nv/nk) == 0) then
+                    do concurrent (j = 1:GD)
+                        cs(kq0+j,po+1) = cs(kq0+j,pi+2); cs(kq0+j,po+2) = cs(kq0+j,pi+3); cs(kq0+j,po+3) = y(kq0+j)
+                        cs(kk0+j,po+1) = cs(kk0+j,pi+2); cs(kk0+j,po+2) = cs(kk0+j,pi+3); cs(kk0+j,po+3) = y(kk0+j)
+                    end do
+                end if
+                do concurrent (j = 1:GD)
+                    cs(vc0+j,po+1) = cs(vc0+j,pi+2); cs(vc0+j,po+2) = cs(vc0+j,pi+3); cs(vc0+j,po+3) = y(vc0+j)
                 end do
             end block
         end do
