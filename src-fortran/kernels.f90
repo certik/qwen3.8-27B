@@ -6,19 +6,23 @@
 ! fused into the GEMVs. The residual stream and its RMSNorm (as `resid` in model.h):
 !   x    residual (H)
 !   xw   x * (weight of the RMSNorm that comes next), the input of the next GEMV
-!   ssp  sum of x**2 in parts: ssp(i) = x(4i-3)**2 + ... + x(4i)**2
-! The GEMV that updates x (gemv_resid, embed) writes all three. The GEMV that consumes the norm
-! (gemv_norm) adds up ssp alongside its dot products and multiplies its rows by rsqrt(sum/H + eps),
-! which gives W (rmsnorm(x) * weight). (CUDA accumulates the sum with atomics instead of parts.)
+!   ss   sum(x**2) in 64-bit fixed point (scale 2**24), in slot k of two: the producer of x (embed,
+!        gemv_resid) adds its rows into ss(k) with a reduce; the next gemv_norm reads ss(k), multiplies
+!        its rows by rsqrt(ss(k)/H + eps), which gives W (rmsnorm(x) * weight), and zeroes the other
+!        slot for the producer after it. Integer sums are the same in any order: the result does not
+!        depend on the order the GPU adds them in.
 !
 ! In a do concurrent over 2 or 3 indices the last one varies fastest between GPU threads. An inner
-! sequential loop that only accumulates into scalars is shared out over the 32 lanes of a warp.
+! sequential loop that only accumulates into scalars is shared out over the lanes of the iteration (a
+! warp, or the threads of a block). The Gated DeltaNet and the attention give an iteration to a head and
+! write its steps as phases, inner loops the lanes share, over arrays local to the iteration (which
+! LFortran keeps in the block's shared memory).
 module kernels
-    use, intrinsic :: iso_fortran_env, only: int16, int32
+    use, intrinsic :: iso_fortran_env, only: int16, int32, int64, real64
     implicit none
     private
-    public :: qmat, bf, embed, gemv_norm, gemv_resid, gdn_conv, gdn_step, gdn_norm
-    public :: attn_qkv, attn_scores, attn_out, argmax_part
+    public :: qmat, bf, embed, gemv_norm, gemv_resid, gdn
+    public :: attn_part, attn_combine, argmax_part, argmax_final, AC, AG, AMAX
 
     ! One MLX affine 8-bit matrix (group size 64) in the checkpoint's own layout: w(:, n) holds the K
     ! bytes of row n (the U32 tensor [N, K/4]), s(:, n) and b(:, n) its K/64 bf16 scales and biases.
@@ -30,6 +34,9 @@ module kernels
 
     integer, parameter :: GD = 128   ! linear attention key/value head dim
     integer, parameter :: HD = 256   ! full attention head dim
+    integer, parameter :: AG = 6     ! full attention query heads per kv head
+    integer, parameter :: AC = 8     ! positions per chunk of the attention (attn_part)
+    integer, parameter :: AMAX = 8192 ! the most positions of the attention (attn_combine)
 
 contains
 
@@ -65,23 +72,25 @@ contains
         q8 = ibits(w((k-1)/4+1, n), 8*modulo(k-1, 4), 8) * bf(s((k-1)/64+1, n)) + bf(b((k-1)/64+1, n))
     end function
 
-    ! x = E(:, tok); xw = x * wn; ssp
-    subroutine embed(w, s, b, tok, wn, x, xw, ssp)
+    ! x = E(:, tokbuf(1)); xw = x * wn; ss(k) += sum(x**2) in fixed point (scale 2**24)
+    subroutine embed(w, s, b, tokbuf, wn, x, xw, ss, k)
         integer(int32), intent(in) :: w(:,:)
         integer(int16), intent(in) :: s(:,:), b(:,:)
-        integer, intent(in) :: tok
+        integer, intent(in) :: tokbuf(:), k
         real, intent(in) :: wn(:)
-        real, intent(inout) :: x(:), xw(:), ssp(:)
-        do concurrent (integer :: i = 1:size(x)/4)
-            x(4*i-3) = q8(w, s, b, 4*i-3, tok+1)
-            x(4*i-2) = q8(w, s, b, 4*i-2, tok+1)
-            x(4*i-1) = q8(w, s, b, 4*i-1, tok+1)
-            x(4*i) = q8(w, s, b, 4*i, tok+1)
+        real, intent(inout) :: x(:), xw(:)
+        integer(int64), intent(inout) :: ss(:)
+        do concurrent (integer :: i = 1:size(x)/4) reduce(+: ss)
+            x(4*i-3) = q8(w, s, b, 4*i-3, tokbuf(1)+1)
+            x(4*i-2) = q8(w, s, b, 4*i-2, tokbuf(1)+1)
+            x(4*i-1) = q8(w, s, b, 4*i-1, tokbuf(1)+1)
+            x(4*i) = q8(w, s, b, 4*i, tokbuf(1)+1)
             xw(4*i-3) = x(4*i-3) * wn(4*i-3)
             xw(4*i-2) = x(4*i-2) * wn(4*i-2)
             xw(4*i-1) = x(4*i-1) * wn(4*i-1)
             xw(4*i) = x(4*i) * wn(4*i)
-            ssp(i) = (x(4*i-3)*x(4*i-3) + x(4*i-2)*x(4*i-2)) + (x(4*i-1)*x(4*i-1) + x(4*i)*x(4*i))
+            ss(k) = ss(k) + nint(((x(4*i-3)*x(4*i-3) + x(4*i-2)*x(4*i-2)) + (x(4*i-1)*x(4*i-1) + x(4*i)*x(4*i))) &
+                * 2.0**24, int64)
         end do
     end subroutine
 
@@ -106,26 +115,27 @@ contains
 
     ! y = rsqrt(sum(ssp)/H + eps) * (W xw). swiglu: the rows are interleaved gate/up pairs
     ! (g1 g2 u1 u2 g3 g4 u3 u4 ...) and y(i) = silu(gate_i) * up_i, for N/2 outputs.
-    subroutine gemv_norm(w, s, b, xw, ssp, eps, swiglu, y)
+    subroutine gemv_norm(w, s, b, xw, ss, k, eps, swiglu, y)
         integer(int32), intent(in) :: w(:,:)
         integer(int16), intent(in) :: s(:,:), b(:,:)
-        real, intent(in) :: xw(:), ssp(:), eps
+        real, intent(in) :: xw(:), eps
+        integer(int64), intent(inout) :: ss(:)
+        integer, intent(in) :: k
         logical, intent(in) :: swiglu
         real, intent(inout) :: y(:)
         do concurrent (integer :: i = 1:size(w, 2)/4)
             block
-                real :: a1, a2, a3, a4, ss, r
+                real :: a1, a2, a3, a4, r
                 integer :: c, n
                 n = 4*i - 3
-                a1 = 0; a2 = 0; a3 = 0; a4 = 0; ss = 0
+                a1 = 0; a2 = 0; a3 = 0; a4 = 0
                 do c = 1, size(w, 1)/4
-                    ss = ss + ((ssp(4*c-3) + ssp(4*c-2)) + (ssp(4*c-1) + ssp(4*c)))
                     a1 = a1 + qdot(w, s, b, xw, n, c)
                     a2 = a2 + qdot(w, s, b, xw, n+1, c)
                     a3 = a3 + qdot(w, s, b, xw, n+2, c)
                     a4 = a4 + qdot(w, s, b, xw, n+3, c)
                 end do
-                r = 1 / sqrt(ss / size(xw) + eps)
+                r = 1 / sqrt(real(real(ss(k), real64) / 2.0_real64**24) / size(xw) + eps)
                 if (swiglu) then
                     y(2*i-1) = a1 * r * sigmoid(a1 * r) * (a3 * r)
                     y(2*i) = a2 * r * sigmoid(a2 * r) * (a4 * r)
@@ -135,17 +145,20 @@ contains
                     y(n+2) = a3 * r
                     y(n+3) = a4 * r
                 end if
+                if (i == 1) ss(3 - k) = 0   ! the other slot, for the next producer of x
             end block
         end do
     end subroutine
 
     ! x += W v; then xw = x * wnext and ssp, for the next RMSNorm (weight wnext)
-    subroutine gemv_resid(w, s, b, v, wnext, x, xw, ssp)
+    subroutine gemv_resid(w, s, b, v, wnext, x, xw, ss, k)
         integer(int32), intent(in) :: w(:,:)
         integer(int16), intent(in) :: s(:,:), b(:,:)
         real, intent(in) :: v(:), wnext(:)
-        real, intent(inout) :: x(:), xw(:), ssp(:)
-        do concurrent (integer :: i = 1:size(w, 2)/4)
+        real, intent(inout) :: x(:), xw(:)
+        integer(int64), intent(inout) :: ss(:)
+        integer, intent(in) :: k
+        do concurrent (integer :: i = 1:size(w, 2)/4) reduce(+: ss)
             block
                 real :: a1, a2, a3, a4
                 integer :: c, n
@@ -165,7 +178,7 @@ contains
                 xw(n+1) = x(n+1) * wnext(n+1)
                 xw(n+2) = x(n+2) * wnext(n+2)
                 xw(n+3) = x(n+3) * wnext(n+3)
-                ssp(i) = (x(n)*x(n) + x(n+1)*x(n+1)) + (x(n+2)*x(n+2) + x(n+3)*x(n+3))
+                ss(k) = ss(k) + nint(((x(n)*x(n) + x(n+1)*x(n+1)) + (x(n+2)*x(n+2) + x(n+3)*x(n+3))) * 2.0**24, int64)
             end block
         end do
     end subroutine
@@ -175,44 +188,37 @@ contains
     ! S(k, v, h) of value head h is updated as S = g*S + khat * delta^T, delta = (v - g*S^T khat)*beta,
     ! and the output o = S^T qhat comes from the old state: o = g*(S^T qhat) + delta*(khat . qhat).
 
-    ! Causal conv (4 taps; cs: the last 3 inputs) + SiLU of the qkv channels.
-    subroutine gdn_conv(y, cw, cs, qkv)
-        real, intent(in) :: y(:), cw(:,:)
-        real, intent(inout) :: cs(:,:), qkv(:)
-        do concurrent (integer :: c = 1:size(qkv))
-            block
-                real :: v
-                v = cw(1,c)*cs(c,1) + cw(2,c)*cs(c,2) + cw(3,c)*cs(c,3) + cw(4,c)*y(c)
-                cs(c,1) = cs(c,2)
-                cs(c,2) = cs(c,3)
-                cs(c,3) = y(c)
-                qkv(c) = v * sigmoid(v)
-            end block
-        end do
-    end subroutine
-
-    ! Column (v, h): the sums over the old state, the gates, delta and the output; then the column
-    ! of the new state, S = g*S + khat * delta^T.
-    subroutine gdn_step(qkv, y, a_log, dt_bias, nk, st, o)
-        real, intent(in) :: qkv(:), y(:), a_log(:), dt_bias(:)
-        integer, intent(in) :: nk
-        real, intent(inout) :: st(:,:,:), o(:,:)
-        integer :: nv, c
+    ! One value head per iteration: the conv of its q, k, v channels, the Gated DeltaNet step and the gated
+    ! RMSNorm. st(v, j, h): the state, v fastest. cs(c, 1:6): conv inputs, double buffered by position parity.
+    subroutine gdn(y, cw, a_log, dt_bias, nw, nk, p, eps, cs, st, out)
+        real, intent(in) :: y(:), cw(:,:), a_log(:), dt_bias(:), nw(:), eps
+        integer, intent(in) :: nk, p
+        real, intent(inout) :: cs(:,:), st(:,:,:), out(:)
+        integer :: nv, c, h
         nv = size(st, 3)
-        c = size(qkv)
-        do concurrent (integer :: h = 1:nv, v = 1:GD)
+        c = size(cw, 2)
+        do concurrent (h = 1:nv)
             block
-                real :: sk, sq, kk, qq, kq, kn, qn, g, beta, delta, sp, dk
-                integer :: j, kq0, kk0
+                real :: q(GD), k(GD), v(GD), o(GD)
+                real :: kk, qq, kn, qn, sp, g, beta, ss, r, sk, sq, delta, z
+                integer :: j, i, kq0, kk0, vc0, pi, po
                 kq0 = ((h-1) / (nv/nk)) * GD
                 kk0 = nk*GD + kq0
-                sk = 0; sq = 0; kk = 0; qq = 0; kq = 0
+                vc0 = 2*nk*GD + (h-1)*GD
+                pi = 3*mod(p, 2)
+                po = 3 - pi
+                do concurrent (j = 1:GD)
+                    q(j) = cw(1,kq0+j)*cs(kq0+j,pi+1) + cw(2,kq0+j)*cs(kq0+j,pi+2) + cw(3,kq0+j)*cs(kq0+j,pi+3) + cw(4,kq0+j)*y(kq0+j)
+                    q(j) = q(j) * sigmoid(q(j))
+                    k(j) = cw(1,kk0+j)*cs(kk0+j,pi+1) + cw(2,kk0+j)*cs(kk0+j,pi+2) + cw(3,kk0+j)*cs(kk0+j,pi+3) + cw(4,kk0+j)*y(kk0+j)
+                    k(j) = k(j) * sigmoid(k(j))
+                    v(j) = cw(1,vc0+j)*cs(vc0+j,pi+1) + cw(2,vc0+j)*cs(vc0+j,pi+2) + cw(3,vc0+j)*cs(vc0+j,pi+3) + cw(4,vc0+j)*y(vc0+j)
+                    v(j) = v(j) * sigmoid(v(j))
+                end do
+                kk = 0; qq = 0
                 do j = 1, GD
-                    sk = sk + st(j,v,h) * qkv(kk0+j)
-                    sq = sq + st(j,v,h) * qkv(kq0+j)
-                    kk = kk + qkv(kk0+j) * qkv(kk0+j)
-                    qq = qq + qkv(kq0+j) * qkv(kq0+j)
-                    kq = kq + qkv(kk0+j) * qkv(kq0+j)
+                    kk = kk + k(j) * k(j)
+                    qq = qq + q(j) * q(j)
                 end do
                 kn = 1 / sqrt(kk + 1e-6)
                 qn = 1 / sqrt(qq + 1e-6) / sqrt(real(GD))
@@ -220,33 +226,35 @@ contains
                 if (sp <= 20) sp = log(1 + exp(sp))
                 g = exp(-exp(a_log(h)) * sp)
                 beta = sigmoid(y(c + nv*GD + h))
-                delta = (qkv(2*nk*GD + (h-1)*GD + v) - g * sk * kn) * beta
-                o(v,h) = (g * sq + delta * kn * kq) * qn
-                dk = delta * kn
-                do j = 1, GD
-                    st(j,v,h) = g * st(j,v,h) + qkv(kk0+j) * dk
+                do concurrent (i = 1:GD)
+                    sk = 0; sq = 0
+                    do j = 1, GD
+                        sk = sk + st(i,j,h) * k(j)
+                    end do
+                    delta = (v(i) - g * sk * kn) * beta
+                    do j = 1, GD
+                        st(i,j,h) = g * st(i,j,h) + k(j) * kn * delta
+                        sq = sq + st(i,j,h) * q(j)
+                    end do
+                    o(i) = sq * qn
                 end do
-            end block
-        end do
-    end subroutine
-
-    ! Gated RMSNorm: out = rmsnorm(o) * w * silu(z), per value head; z = y(z0+1:).
-    subroutine gdn_norm(o, y, z0, nw, eps, out)
-        real, intent(in) :: o(:,:), y(:), nw(:), eps
-        integer, intent(in) :: z0
-        real, intent(inout) :: out(:)
-        do concurrent (integer :: h = 1:size(o, 2))
-            block
-                real :: ss, r, z
-                integer :: j, v
                 ss = 0
                 do j = 1, GD
-                    ss = ss + o(j,h) * o(j,h)
+                    ss = ss + o(j) * o(j)
                 end do
                 r = 1 / sqrt(ss / GD + eps)
-                do v = 1, GD
-                    z = y(z0 + (h-1)*GD + v)
-                    out((h-1)*GD + v) = o(v,h) * r * nw(v) * z * sigmoid(z)
+                do concurrent (i = 1:GD)
+                    z = y(c + (h-1)*GD + i)
+                    out((h-1)*GD + i) = o(i) * r * nw(i) * z * sigmoid(z)
+                end do
+                if (mod(h-1, nv/nk) == 0) then
+                    do concurrent (j = 1:GD)
+                        cs(kq0+j,po+1) = cs(kq0+j,pi+2); cs(kq0+j,po+2) = cs(kq0+j,pi+3); cs(kq0+j,po+3) = y(kq0+j)
+                        cs(kk0+j,po+1) = cs(kk0+j,pi+2); cs(kk0+j,po+2) = cs(kk0+j,pi+3); cs(kk0+j,po+3) = y(kk0+j)
+                    end do
+                end if
+                do concurrent (j = 1:GD)
+                    cs(vc0+j,po+1) = cs(vc0+j,pi+2); cs(vc0+j,po+2) = cs(vc0+j,pi+3); cs(vc0+j,po+3) = y(vc0+j)
                 end do
             end block
         end do
@@ -256,99 +264,134 @@ contains
     ! y = [q|gate per head (nq*512) | k (nkv*256) | v (nkv*256)]. q and k get an RMSNorm and a
     ! rotate-half RoPE on their first 64 dims (cos/sin of the 32 angles of position t: rc(:, t+1), rs(:, t+1)).
 
-    ! The q heads and the k head (RMSNorm, RoPE) of position p: q into qr (scaled by 1/sqrt(256)), k and
-    ! v appended to the caches. Head hh = 1..nq is a q head, nq+1..nq+nkv a k head.
-    subroutine attn_qkv(y, qw, kw, rc, rs, eps, p, qr, kc, vc)
+    ! The attention of the new token (at position p, from 0) by kv head and chunk of AC positions: the
+    ! RMSNorm and RoPE of the kv head's AG query heads and of its key, the scores of the chunk's positions,
+    ! their softmax within the chunk, and the weighted sum of the chunk's values (flash decoding). The chunk
+    ! with the new position first appends its key and value to the caches kc(d, kh, t) and vc(d, kh, t).
+    ! The maximum, the sum of the exponentials and the weighted sum of each query head and chunk go to
+    ! pm(i, kh, c), pl(i, kh, c) and pa(d, i, kh, c), which attn_combine merges.
+    subroutine attn_part(y, qw, kw, rc, rs, eps, p, kc, vc, pm, pl, pa)
         real, intent(in) :: y(:), qw(:), kw(:), rc(:,:), rs(:,:), eps
         integer, intent(in) :: p
-        real, intent(inout) :: qr(:,:), kc(:,:,:), vc(:,:,:)
-        integer :: nq, nkv
-        nq = size(qr, 2)
+        real, intent(inout) :: kc(:,:,:), vc(:,:,:), pm(:,:,:), pl(:,:,:), pa(:,:,:,:)
+        integer :: nkv, nq
         nkv = size(kc, 2)
-        do concurrent (integer :: hh = 1:nq+nkv, d = 1:HD)
+        nq = AG*nkv
+        do concurrent (integer :: kh = 1:nkv, c = 1:p/AC + 1)
             block
-                real :: ss, cs, sn, w, wp, r
-                integer :: j, b, dp
-                if (hh <= nq) then
-                    b = (hh-1)*2*HD
-                else
-                    b = nq*2*HD + (hh-nq-1)*HD
-                end if
-                ss = 0
-                do j = 1, HD
-                    ss = ss + y(b+j) * y(b+j)
+                real :: x(HD, AG+1), w(AC, AG), nrm(AG+1)
+                real :: ss, cs, sn, s, m, l
+                integer :: i, j, d, dp, u, t, b
+                ! the norms of the AG query heads and of the key
+                do concurrent (i = 1:AG+1)
+                    b = merge(((kh-1)*AG + i - 1)*2*HD, nq*2*HD + (kh-1)*HD, i <= AG)
+                    ss = 0
+                    do j = 1, HD
+                        ss = ss + y(b+j)**2
+                    end do
+                    nrm(i) = 1 / sqrt(ss/HD + eps)
                 end do
-                if (d <= 32) then   ! rotate-half RoPE on dims 1..64: pairs (d, d+32)
-                    dp = d + 32; cs = rc(d,p+1); sn = -rs(d,p+1)
-                else if (d <= 64) then
-                    dp = d - 32; cs = rc(d-32,p+1); sn = rs(d-32,p+1)
-                else
-                    dp = d; cs = 1; sn = 0
+                ! normalized and rotated (rotate-half RoPE on dims 1..64), the queries scaled by 1/sqrt(HD)
+                do concurrent (d = 1:HD)
+                    if (d <= 32) then
+                        dp = d + 32; cs = rc(d,p+1); sn = -rs(d,p+1)
+                    else if (d <= 64) then
+                        dp = d - 32; cs = rc(d-32,p+1); sn = rs(d-32,p+1)
+                    else
+                        dp = d; cs = 1; sn = 0
+                    end if
+                    do i = 1, AG
+                        b = ((kh-1)*AG + i - 1)*2*HD
+                        x(d,i) = (y(b+d)*qw(d)*cs + y(b+dp)*qw(dp)*sn) * nrm(i) / 16
+                    end do
+                    b = nq*2*HD + (kh-1)*HD
+                    x(d,AG+1) = (y(b+d)*kw(d)*cs + y(b+dp)*kw(dp)*sn) * nrm(AG+1)
+                end do
+                if (c == p/AC + 1) then
+                    do concurrent (d = 1:HD)
+                        kc(d,kh,p+1) = x(d,AG+1)
+                        vc(d,kh,p+1) = y(nq*2*HD + nkv*HD + (kh-1)*HD + d)
+                    end do
                 end if
-                if (hh <= nq) then
-                    w = qw(d); wp = qw(dp)
-                else
-                    w = kw(d); wp = kw(dp)
-                end if
-                r = (y(b+d) * w * cs + y(b+dp) * wp * sn) / sqrt(ss / HD + eps)
-                if (hh <= nq) then
-                    qr(d,hh) = r / 16
-                else
-                    kc(d,hh-nq,p+1) = r
-                    vc(p+1,d,hh-nq) = y(nq*2*HD + nkv*HD + (hh-nq-1)*HD + d)
-                end if
+                ! the scores of the chunk's positions (past the new one, again the new one)
+                do concurrent (u = 1:AC)
+                    t = min((c-1)*AC + u, p+1)
+                    do i = 1, AG
+                        s = 0
+                        do d = 1, HD
+                            s = s + x(d,i)*kc(d,kh,t)
+                        end do
+                        w(u,i) = s
+                    end do
+                end do
+                ! their softmax within the chunk: no weight past the new position
+                do concurrent (i = 1:AG)
+                    m = -huge(1.0)
+                    do u = 1, AC
+                        m = max(m, merge(w(u,i), -huge(1.0), (c-1)*AC + u <= p+1))
+                    end do
+                    l = 0
+                    do u = 1, AC
+                        w(u,i) = merge(exp(w(u,i) - m), 0.0, (c-1)*AC + u <= p+1)
+                        l = l + w(u,i)
+                    end do
+                    pm(i,kh,c) = m
+                    pl(i,kh,c) = l
+                end do
+                ! the weighted sums of the chunk's values, by dimension: each value read once for all the
+                ! query heads
+                do concurrent (d = 1:HD)
+                    block
+                        real :: v(AC)
+                        do u = 1, AC
+                            v(u) = vc(d,kh,min((c-1)*AC + u, p+1))
+                        end do
+                        do i = 1, AG
+                            s = 0
+                            do u = 1, AC
+                                s = s + w(u,i)*v(u)
+                            end do
+                            pa(d,i,kh,c) = s
+                        end do
+                    end block
+                end do
             end block
         end do
     end subroutine
 
-    ! sc(t, h) = q_h . k_t for the positions t = 1..n
-    subroutine attn_scores(qr, kc, n, sc)
-        real, intent(in) :: qr(:,:), kc(:,:,:)
-        integer, intent(in) :: n
-        real, intent(inout) :: sc(:,:)
-        integer :: nq, nkv
-        nq = size(qr, 2)
-        nkv = size(kc, 2)
-        do concurrent (integer :: h = 1:nq, t = 1:n)
-            block
-                real :: dot
-                integer :: d, kh
-                kh = (h-1) / (nq/nkv) + 1
-                dot = 0
-                do d = 1, HD
-                    dot = dot + qr(d,h) * kc(d,kh,t)
-                end do
-                sc(t,h) = dot
-            end block
-        end do
-    end subroutine
-
-    ! out = softmax(sc) V * sigmoid(gate). The V cache is vc(t, d, kh), so that the sum over the
-    ! positions t reads along its first index and the lanes share it.
-    subroutine attn_out(y, sc, vc, n, out)
-        real, intent(in) :: y(:), sc(:,:), vc(:,:,:)
-        integer, intent(in) :: n
+    ! out = softmax(scores) V * sigmoid(gate), from the chunks of attn_part: by query head, the weight of
+    ! each chunk (its exponentials' share of the sum of all), then the weighted sum of the chunks' sums.
+    subroutine attn_combine(y, pm, pl, pa, p, out)
+        real, intent(in) :: y(:), pm(:,:,:), pl(:,:,:), pa(:,:,:,:)
+        integer, intent(in) :: p
         real, intent(inout) :: out(:)
-        integer :: nq, nkv
-        nq = size(sc, 2)
-        nkv = size(vc, 3)
-        do concurrent (integer :: h = 1:nq, d = 1:HD)
+        integer :: nkv
+        nkv = size(pm, 2)
+        do concurrent (integer :: h = 1:AG*nkv)
             block
-                real :: m, l, acc, e
-                integer :: t, kh
-                kh = (h-1) / (nq/nkv) + 1
-                m = -huge(m)
-                do t = 1, n
-                    m = max(m, sc(t,h))
+                real :: f(AMAX/AC + 1)
+                real :: mm, den, num
+                integer :: c, i, kh, d
+                kh = (h-1)/AG + 1
+                i = h - (kh-1)*AG
+                mm = -huge(1.0)
+                do c = 1, p/AC + 1
+                    mm = max(mm, pm(i,kh,c))
                 end do
-                l = 0
-                acc = 0
-                do t = 1, n
-                    e = exp(sc(t,h) - m)
-                    l = l + e
-                    acc = acc + e * vc(t,d,kh)
+                do concurrent (c = 1:p/AC + 1)
+                    f(c) = exp(pm(i,kh,c) - mm)
                 end do
-                out((h-1)*HD + d) = acc / l * sigmoid(y((h-1)*2*HD + HD + d))
+                den = 0
+                do c = 1, p/AC + 1
+                    den = den + f(c)*pl(i,kh,c)
+                end do
+                do concurrent (d = 1:HD)
+                    num = 0
+                    do c = 1, p/AC + 1
+                        num = num + f(c)*pa(d,i,kh,c)
+                    end do
+                    out((h-1)*HD + d) = num/den * sigmoid(y((h-1)*2*HD + HD + d))
+                end do
             end block
         end do
     end subroutine
@@ -376,6 +419,30 @@ contains
                 end do
                 pv(i) = m
                 pi(i) = bi
+            end block
+        end do
+    end subroutine
+
+
+    ! The token of the largest of the parts (pv, pi) into tokbuf(1) (for the next embed) and hist(pos+1)
+    subroutine argmax_final(pv, pi, np, pos, tokbuf, hist)
+        real, intent(in) :: pv(:)
+        integer, intent(in) :: pi(:), np, pos
+        integer, intent(inout) :: tokbuf(:), hist(:)
+        do concurrent (integer :: i = 1:1)
+            block
+                real :: m
+                integer :: j, bi
+                m = -huge(m)
+                do j = 1, np
+                    m = max(m, pv(j))
+                end do
+                bi = huge(bi)
+                do j = 1, np
+                    if (pv(j) == m) bi = min(bi, pi(j))
+                end do
+                tokbuf(i) = bi - 1
+                hist(pos+i) = bi - 1
             end block
         end do
     end subroutine

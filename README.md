@@ -6,7 +6,7 @@ in three implementations that read the same safetensors files:
 | Directory | What |
 |---|---|
 | [`src-cpu`](src-cpu) | Single-threaded C99 reference: the numerical specification |
-| `src-fortran` | Fortran implementation of `src-cuda`, run on the GPU through LFortran, about 114 tok/s decode on one H200 |
+| `src-fortran` | Fortran implementation of `src-cuda`, run on the GPU through LFortran, about 119 tok/s decode on one H200 |
 | `src-cuda` | C + CUDA implementation, about 120 tok/s decode on one H200 |
 
 ## Download the weights
@@ -64,7 +64,7 @@ ids to stderr. Generation is greedy.
 
 ### NVIDIA GPU
 
-Built with LFortran `main` at `a5126efe16`, run on one H200 NVL (the timing lines go to stderr):
+Built with LFortran `main` at `2e12da0696`, run on one H200 NVL (the timing lines go to stderr):
 
 ````console
 $ ./qwen-fortran-cuda -m "$MODEL_DIR" --no-think -n 128 \
@@ -93,12 +93,12 @@ function fib(n) result(f)
     end if
 end function fib
 ```
-tokenizer .1 s, weights + state in 6.0 s, prompt 25 tokens
-prefill: 25 tokens in .858 s (29.2 tok/s); decode: 126 tokens in 1.110 s (113.5 tok/s)
+tokenizer .2 s, weights + state in 6.5 s, prompt 25 tokens
+prefill: 25 tokens in .848 s (29.5 tok/s); decode: 126 tokens in 1.059 s (119.0 tok/s)
 ````
 
-Decode speed on one H200 NVL: **about 114 tok/s** (3 runs: 113.6 to 113.8 tok/s); for comparison the CUDA
-implementation reaches about 120 tok/s. The greedy token ids are identical to those of `src-cuda`.
+Decode speed on one H200 NVL: **about 119 tok/s** (5 runs: 118.9 to 119.4 tok/s, median 119.0); for comparison the
+CUDA implementation reaches 120.4 to 120.6 tok/s (median 120.5) in the same runs. The greedy token ids are identical to those of `src-cuda`.
 The prompt goes through the same single-token forward pass, one token at a time (prefill is not
 optimized).
 See [`src-fortran/README.md`](src-fortran/README.md).
