@@ -10,8 +10,9 @@ $ ./qwen-fortran-cuda -m "$MODEL_DIR" --no-think -n 128 \
     -p "Write a Fortran function that returns the n-th Fibonacci number."
 ```
 
-Building needs a recent LFortran `main` (`6dff42a212` or later, with the GPU work of
-[#18109](https://github.com/lfortran/lfortran/pull/18109), [#18113](https://github.com/lfortran/lfortran/pull/18113), [#18121](https://github.com/lfortran/lfortran/pull/18121), [#18122](https://github.com/lfortran/lfortran/pull/18122), [#18124](https://github.com/lfortran/lfortran/pull/18124)).
+Building needs a recent LFortran `main` (`2e12da0696` or later, with the GPU work of
+[#18109](https://github.com/lfortran/lfortran/pull/18109), [#18113](https://github.com/lfortran/lfortran/pull/18113), [#18121](https://github.com/lfortran/lfortran/pull/18121), [#18122](https://github.com/lfortran/lfortran/pull/18122), [#18124](https://github.com/lfortran/lfortran/pull/18124),
+[#18240](https://github.com/lfortran/lfortran/pull/18240)).
 The linker defaults to clang; `LFORTRAN_LINKER=gcc` uses gcc instead.
 
 On one H200 NVL this decodes at about 119 tok/s (the CUDA implementation: about 120.5 tok/s), and the
